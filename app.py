@@ -7,6 +7,11 @@ import os
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
 from db import LemlistDB
+from hubspot_client import (
+    HubSpotClient, HubSpotError, HubSpotUnauthorizedError,
+    HubSpotRateLimitError, HubSpotNotFoundError
+)
+from hubspot_notes_analyzer import NotesAnalyzer, LemlistNoteParser
 import logging
 
 # Configure logging
@@ -17,6 +22,51 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # Constants
 # ============================================================================
+
+# Activity types to filter out (not useful for analysis)
+FILTERED_ACTIVITY_TYPES = {'hasEmailAddress', 'conditionChosen'}
+
+# Activity types to deduplicate (keep only first occurrence per unique key)
+# Key for emailsOpened: (leadEmail, emailTemplateId, sequenceStep)
+DEDUPLICATE_ACTIVITY_TYPES = {'emailsOpened'}
+
+
+def deduplicate_activities(activities: List[Dict]) -> List[Dict]:
+    """Remove duplicate activities based on type-specific deduplication rules.
+
+    For emailsOpened: Keep only first open per (leadEmail, emailTemplateId, sequenceStep).
+    This removes duplicate tracking pixel loads from email clients.
+
+    Args:
+        activities: List of activity dicts from Lemlist API
+
+    Returns:
+        Deduplicated list of activities
+    """
+    seen_keys = set()
+    result = []
+
+    for activity in activities:
+        activity_type = activity.get('type')
+
+        if activity_type in DEDUPLICATE_ACTIVITY_TYPES:
+            # Create unique key for deduplication
+            key = (
+                activity.get('leadEmail'),
+                activity.get('emailTemplateId'),
+                activity.get('sequenceStep')
+            )
+
+            if key in seen_keys:
+                # Skip duplicate
+                continue
+
+            seen_keys.add(key)
+
+        result.append(activity)
+
+    return result
+
 
 # Activity type mapping for German display names
 ACTIVITY_TYPE_MAP = {
@@ -152,7 +202,12 @@ class LemlistClient:
             raise Exception(f"Ungültige JSON Response von {endpoint}: {str(e)}")
 
     def get_all_activities(self, campaign_id: str) -> List[Dict]:
-        """Fetch all activities for a campaign with pagination"""
+        """Fetch all activities for a campaign with pagination.
+
+        Automatically:
+        - Filters out activity types defined in FILTERED_ACTIVITY_TYPES
+        - Deduplicates emailsOpened (keeps first per lead/template/step)
+        """
         all_activities = []
         offset = 0
         limit = 100
@@ -165,7 +220,9 @@ class LemlistClient:
             if not activities or len(activities) == 0:
                 break
 
-            all_activities.extend(activities)
+            # Filter out unwanted activity types before adding to results
+            filtered = [a for a in activities if a.get('type') not in FILTERED_ACTIVITY_TYPES]
+            all_activities.extend(filtered)
 
             # If we got fewer results than limit, we've reached the end
             if len(activities) < limit:
@@ -176,7 +233,8 @@ class LemlistClient:
             # Small delay to respect rate limits
             time.sleep(0.1)
 
-        return all_activities
+        # Deduplicate activities (e.g., multiple emailsOpened from same email)
+        return deduplicate_activities(all_activities)
 
     def get_lead_details(self, email: str) -> Dict:
         """Fetch detailed information for a specific lead by email
@@ -572,31 +630,38 @@ def sync_campaign_data(api_key: str, campaign_id: str, force_full_reload: bool =
     return load_campaign_data_from_db(campaign_id)
 
 
-def fetch_lead_details_batch(api_key: str, campaign_id: str, batch_size: int = 10) -> Dict[str, int]:
-    """Fetch HubSpot IDs and LinkedIn URLs for leads that don't have them yet
+def fetch_all_lead_details(api_key: str, campaign_id: str,
+                           batch_size: int = 50, pause_seconds: float = 2.0,
+                           progress_callback=None) -> Dict[str, int]:
+    """Fetch HubSpot IDs and LinkedIn URLs for ALL leads that don't have them yet.
+
+    Processes all leads automatically with a pause every batch_size leads.
 
     Args:
         api_key: Lemlist API key
         campaign_id: Campaign ID
-        batch_size: Number of leads to process in this batch
+        batch_size: Number of leads to process before pausing (default 50)
+        pause_seconds: Seconds to pause after each batch (default 2.0)
+        progress_callback: Optional callback function(current, total) for progress updates
 
     Returns:
-        Dict with statistics: {'processed': int, 'success': int, 'failed': int, 'remaining': int}
+        Dict with statistics: {'processed': int, 'success': int, 'failed': int}
     """
     db = LemlistDB()
     client = LemlistClient(api_key)
 
-    # Get leads without HubSpot ID (returns list of dicts with lead_id and email)
-    leads_to_fetch = db.get_leads_without_hubspot_id(campaign_id, limit=batch_size)
+    # Get ALL leads without HubSpot ID
+    leads_to_fetch = db.get_leads_without_hubspot_id(campaign_id, limit=10000)
 
     if not leads_to_fetch:
-        return {'processed': 0, 'success': 0, 'failed': 0, 'remaining': 0}
+        return {'processed': 0, 'success': 0, 'failed': 0}
 
+    total = len(leads_to_fetch)
     processed = 0
     success = 0
     failed = 0
 
-    for lead_info in leads_to_fetch:
+    for i, lead_info in enumerate(leads_to_fetch):
         lead_id = lead_info['lead_id']
         email = lead_info['email']
 
@@ -612,7 +677,6 @@ def fetch_lead_details_batch(api_key: str, campaign_id: str, batch_size: int = 1
             # Update DB using lead_id as identifier
             db.update_lead_details(lead_id, hubspot_id=hubspot_id, linkedin_url=linkedin_url)
 
-            processed += 1
             if hubspot_id or linkedin_url:
                 success += 1
 
@@ -621,17 +685,118 @@ def fetch_lead_details_batch(api_key: str, campaign_id: str, batch_size: int = 1
 
         except Exception as e:
             logger.warning(f"Failed to fetch details for {email} (lead_id={lead_id}): {e}")
-            processed += 1
             failed += 1
 
-    # Count remaining leads
-    remaining = len(db.get_leads_without_hubspot_id(campaign_id, limit=1000))
+        processed += 1
+
+        # Update progress
+        if progress_callback:
+            progress_callback(processed, total)
+
+        # Pause every batch_size leads (but not at the very end)
+        if processed % batch_size == 0 and processed < total:
+            time.sleep(pause_seconds)
+
+    return {
+        'processed': processed,
+        'success': success,
+        'failed': failed
+    }
+
+
+def sync_to_hubspot(campaign_id: str, hubspot_token: str,
+                    batch_size: int = 50, progress_callback=None) -> Dict[str, int]:
+    """Sync lead metrics from database to HubSpot.
+
+    Calculates aggregated engagement metrics for each lead and updates
+    the corresponding HubSpot contact properties.
+
+    Args:
+        campaign_id: Campaign ID to sync
+        hubspot_token: HubSpot Private App access token
+        batch_size: Number of contacts per batch (max 100)
+        progress_callback: Optional callback function(current, total) for progress updates
+
+    Returns:
+        Dict with statistics: {'processed': int, 'success': int, 'failed': int, 'skipped': int}
+    """
+    db = LemlistDB()
+    hubspot = HubSpotClient(hubspot_token)
+
+    # Get all leads with HubSpot IDs
+    leads = db.get_all_leads_with_hubspot_ids(campaign_id)
+
+    if not leads:
+        return {'processed': 0, 'success': 0, 'failed': 0, 'skipped': 0}
+
+    processed = 0
+    success = 0
+    failed = 0
+    skipped = 0
+
+    # Process in batches
+    for i in range(0, len(leads), batch_size):
+        batch = leads[i:i + batch_size]
+
+        # Calculate metrics for each lead and prepare batch update
+        updates = []
+        for lead in batch:
+            email = lead['email']
+            hubspot_id = lead['hubspot_id']
+
+            # Calculate metrics
+            metrics = db.calculate_lead_metrics(email, campaign_id)
+
+            if metrics:
+                # Filter out None values (HubSpot doesn't accept null)
+                filtered_metrics = {k: v for k, v in metrics.items() if v is not None}
+
+                updates.append({
+                    'id': hubspot_id,
+                    'properties': filtered_metrics
+                })
+            else:
+                skipped += 1
+
+        # Batch update to HubSpot
+        if updates:
+            try:
+                hubspot.batch_update_contacts(updates)
+                success += len(updates)
+            except HubSpotNotFoundError as e:
+                # Some contacts might not exist, try individual updates
+                logger.warning(f"Batch update had missing contacts, trying individual: {e}")
+                for update in updates:
+                    try:
+                        hubspot.update_contact_properties(
+                            update['id'],
+                            update['properties']
+                        )
+                        success += 1
+                    except HubSpotNotFoundError:
+                        logger.warning(f"Contact {update['id']} not found in HubSpot")
+                        failed += 1
+                    except HubSpotError as e:
+                        logger.error(f"Failed to update contact {update['id']}: {e}")
+                        failed += 1
+            except HubSpotError as e:
+                logger.error(f"Batch {i // batch_size + 1} failed: {e}")
+                failed += len(updates)
+
+        processed += len(batch)
+
+        # Update progress
+        if progress_callback:
+            progress_callback(processed, len(leads))
+
+        # Rate limit: 4 req/sec for Batch API
+        time.sleep(0.25)
 
     return {
         'processed': processed,
         'success': success,
         'failed': failed,
-        'remaining': remaining
+        'skipped': skipped
     }
 
 
@@ -786,15 +951,223 @@ def main():
             leads_without_hubspot = stats['leads'] - stats['leads_with_hubspot']
             if leads_without_hubspot > 0:
                 st.warning(f"⚠️ {leads_without_hubspot} Leads ohne HubSpot/LinkedIn Daten")
-                if st.button("⬇️ Lead Details laden (50 Leads)", use_container_width=True, help="Holt HubSpot IDs und LinkedIn URLs für 50 Leads"):
-                    with st.spinner("Lade Lead Details..."):
-                        result = fetch_lead_details_batch(api_key, campaign_id, batch_size=50)
-                        st.success(f"✅ {result['processed']} Leads verarbeitet, {result['success']} erfolgreich")
-                        if result['remaining'] > 0:
-                            st.info(f"ℹ️ Noch {result['remaining']} Leads übrig")
-                        st.rerun()
+                if st.button("⬇️ Alle Lead Details laden", use_container_width=True,
+                            help=f"Holt HubSpot IDs und LinkedIn URLs für alle {leads_without_hubspot} Leads (Pause alle 50 Leads)"):
+                    progress_bar = st.progress(0, text="Lade Lead Details...")
+
+                    def update_lead_progress(current, total):
+                        progress = current / total if total > 0 else 0
+                        progress_bar.progress(progress, text=f"Lade Lead Details... {current}/{total} (Pause alle 50 Leads)")
+
+                    result = fetch_all_lead_details(
+                        api_key,
+                        campaign_id,
+                        batch_size=50,
+                        pause_seconds=2.0,
+                        progress_callback=update_lead_progress
+                    )
+                    progress_bar.empty()
+
+                    st.success(f"✅ {result['processed']} Leads verarbeitet, {result['success']} mit Daten gefunden")
+                    if result['failed'] > 0:
+                        st.warning(f"⚠️ {result['failed']} Leads fehlgeschlagen")
+                    st.rerun()
             else:
                 st.success("✅ Alle Leads haben HubSpot/LinkedIn Daten")
+
+        st.divider()
+
+        # HubSpot Sync Section
+        st.header("🔄 HubSpot Sync")
+
+        # Load HubSpot token from .env
+        default_hubspot_token = os.getenv("HUBSPOT_API_TOKEN", "")
+
+        hubspot_token = st.text_input(
+            "HubSpot API Token",
+            value=default_hubspot_token,
+            type="password",
+            help="Private App Token aus HubSpot Settings → Integrations → Private Apps"
+        )
+
+        # Show sync readiness
+        if campaign_in_db and stats:
+            leads_with_hubspot = stats.get('leads_with_hubspot', 0)
+            if leads_with_hubspot > 0:
+                st.info(f"ℹ️ {leads_with_hubspot} Leads bereit für HubSpot Sync")
+            else:
+                st.warning("⚠️ Keine Leads mit HubSpot IDs gefunden. Bitte erst 'Lead Details laden'.")
+
+        # Sync button
+        sync_to_hubspot_disabled = not (campaign_id and hubspot_token and stats and stats.get('leads_with_hubspot', 0) > 0)
+        if st.button("⬆️ Nach HubSpot syncen", use_container_width=True, disabled=sync_to_hubspot_disabled,
+                     help="Synchronisiert Engagement-Metriken zu HubSpot Custom Properties"):
+            try:
+                # Verify token first
+                hubspot_client = HubSpotClient(hubspot_token)
+                if not hubspot_client.verify_token():
+                    st.error("❌ Ungültiger HubSpot API Token")
+                else:
+                    # Create progress bar
+                    progress_bar = st.progress(0, text="Synchronisiere Metriken zu HubSpot...")
+
+                    def update_progress(current, total):
+                        progress = current / total if total > 0 else 0
+                        progress_bar.progress(progress, text=f"Synchronisiere... {current}/{total} Leads")
+
+                    # Run sync
+                    result = sync_to_hubspot(
+                        campaign_id,
+                        hubspot_token,
+                        batch_size=50,
+                        progress_callback=update_progress
+                    )
+
+                    progress_bar.empty()
+
+                    # Show results
+                    if result['success'] > 0:
+                        st.success(f"✅ {result['success']} von {result['processed']} Leads erfolgreich gesynct")
+
+                    if result['failed'] > 0:
+                        st.warning(f"⚠️ {result['failed']} Leads fehlgeschlagen")
+
+                    if result['skipped'] > 0:
+                        st.info(f"ℹ️ {result['skipped']} Leads ohne Activities übersprungen")
+
+            except HubSpotUnauthorizedError:
+                st.error("❌ Ungültiger HubSpot API Token")
+            except HubSpotRateLimitError as e:
+                st.error(f"❌ HubSpot Rate Limit erreicht. Bitte warte {e.retry_after}s und versuche es erneut.")
+            except HubSpotError as e:
+                st.error(f"❌ HubSpot Fehler: {str(e)}")
+            except Exception as e:
+                st.error(f"❌ Fehler beim Sync: {str(e)}")
+                with st.expander("🔍 Details"):
+                    st.exception(e)
+
+        st.divider()
+
+        # HubSpot Notes Analysis Section
+        with st.expander("🔍 HubSpot Notes Analyse", expanded=False):
+            st.caption("Analysiere Lemlist Notes in HubSpot und finde Duplikate")
+
+            notes_analysis_disabled = not (campaign_id and hubspot_token and stats and stats.get('leads_with_hubspot', 0) > 0)
+
+            if st.button("📥 Notes von HubSpot laden", use_container_width=True,
+                        disabled=notes_analysis_disabled,
+                        help="Lädt alle Notes für Leads in dieser Campaign"):
+                try:
+                    hubspot_client = HubSpotClient(hubspot_token)
+                    analyzer = NotesAnalyzer(hubspot_client, db)
+
+                    progress_bar = st.progress(0, text="Lade Notes von HubSpot...")
+
+                    def update_notes_progress(current, total):
+                        progress = current / total if total > 0 else 0
+                        progress_bar.progress(progress, text=f"Lade Notes... {current}/{total} Leads")
+
+                    notes = analyzer.fetch_all_notes(campaign_id, progress_callback=update_notes_progress)
+                    progress_bar.empty()
+
+                    # Store in session state
+                    st.session_state['hubspot_notes'] = notes
+                    st.session_state['notes_campaign_id'] = campaign_id
+
+                    # Count Lemlist notes vs total
+                    lemlist_notes = [n for n in notes if n.get('parsed')]
+                    st.success(f"✅ {len(notes)} Notes geladen ({len(lemlist_notes)} Lemlist Notes)")
+
+                except HubSpotError as e:
+                    st.error(f"❌ HubSpot Fehler: {str(e)}")
+                except Exception as e:
+                    st.error(f"❌ Fehler: {str(e)}")
+
+            # Show analysis if notes are loaded
+            if 'hubspot_notes' in st.session_state and st.session_state.get('notes_campaign_id') == campaign_id:
+                notes = st.session_state['hubspot_notes']
+                lemlist_notes = [n for n in notes if n.get('parsed')]
+
+                st.markdown("---")
+                st.markdown(f"**{len(lemlist_notes)} Lemlist Notes** von {len(notes)} total")
+
+                # Find duplicates
+                hubspot_client = HubSpotClient(hubspot_token) if hubspot_token else None
+                if hubspot_client:
+                    analyzer = NotesAnalyzer(hubspot_client, db)
+                    duplicates = analyzer.find_duplicates(notes)
+                    dup_stats = analyzer.get_duplicate_stats(duplicates)
+
+                    if duplicates:
+                        st.warning(f"⚠️ {dup_stats['total_duplicate_groups']} Duplikat-Gruppen gefunden")
+                        st.caption(f"{dup_stats['total_to_delete']} Notes können gelöscht werden")
+
+                        # Show duplicate details
+                        with st.expander(f"📋 Duplikate anzeigen ({len(duplicates)} Gruppen)"):
+                            for i, group in enumerate(duplicates[:10]):  # Limit to first 10
+                                parsed = group[0].get('parsed', {})
+                                st.markdown(f"**{i+1}. {group[0].get('lead_email', 'Unknown')}**")
+                                st.caption(f"{parsed.get('activity_text', 'Unknown')} - {parsed.get('campaign', '')} (step {parsed.get('step', '?')})")
+                                st.caption(f"📝 {len(group)} Notes (davon {len(group)-1} Duplikate)")
+                                st.markdown("---")
+
+                            if len(duplicates) > 10:
+                                st.caption(f"... und {len(duplicates) - 10} weitere Gruppen")
+
+                        # Delete button
+                        if st.button("🗑️ Alle Duplikate löschen (neueste behalten)",
+                                    use_container_width=True,
+                                    type="secondary"):
+                            try:
+                                progress_bar = st.progress(0, text="Lösche Duplikate...")
+
+                                def update_delete_progress(current, total):
+                                    progress = current / total if total > 0 else 0
+                                    progress_bar.progress(progress, text=f"Lösche... {current}/{total}")
+
+                                result = analyzer.delete_duplicates(
+                                    duplicates,
+                                    keep_newest=True,
+                                    progress_callback=update_delete_progress
+                                )
+                                progress_bar.empty()
+
+                                st.success(f"✅ {result['deleted']} Duplikate gelöscht")
+                                if result['failed'] > 0:
+                                    st.warning(f"⚠️ {result['failed']} konnten nicht gelöscht werden")
+
+                                # Clear cached notes
+                                del st.session_state['hubspot_notes']
+
+                            except Exception as e:
+                                st.error(f"❌ Fehler: {str(e)}")
+                    else:
+                        st.success("✅ Keine Duplikate gefunden")
+
+                    # DB Comparison
+                    st.markdown("---")
+                    st.markdown("**📊 Vergleich mit Datenbank**")
+
+                    comparison = analyzer.compare_with_db(notes, campaign_id)
+                    comp_stats = comparison['stats']
+
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("✅ Match", comp_stats['matched_count'])
+                    col2.metric("📝 Nur Notes", comp_stats['notes_only_count'])
+                    col3.metric("📊 Nur DB", comp_stats['db_only_count'])
+
+                    if comp_stats['notes_only_count'] > 0:
+                        with st.expander(f"Notes ohne DB-Eintrag ({comp_stats['notes_only_count']})"):
+                            for note in comparison['in_notes_not_db'][:10]:
+                                if note:
+                                    parsed = note.get('parsed', {})
+                                    st.caption(f"• {note.get('lead_email', '?')} - {parsed.get('activity_text', '?')}")
+
+                    if comp_stats['db_only_count'] > 0:
+                        with st.expander(f"DB-Activities ohne Note ({comp_stats['db_only_count']})"):
+                            for activity in comparison['in_db_not_notes'][:10]:
+                                if activity:
+                                    st.caption(f"• {activity.get('lead_email', '?')} - {activity.get('type', '?')}")
 
         st.divider()
 

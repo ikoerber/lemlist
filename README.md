@@ -9,9 +9,13 @@ Eine robuste Streamlit-App zum Extrahieren und Analysieren von Leads und Activit
 - **SQLite Datenbank**: Lokales Caching aller Daten für schnellen Zugriff
 - **Incremental Updates**: Lädt nur neue Activities seit letztem Sync
 - **HubSpot Integration**: Automatisches Fetching von HubSpot IDs mit klickbaren Links
+- **HubSpot Sync**: Engagement-Metriken zu HubSpot Custom Properties synchronisieren
+- **HubSpot Notes Analyse**: Lemlist Notes in HubSpot analysieren und Duplikate bereinigen
 - **LinkedIn URLs**: Klickbare LinkedIn Profile direkt in der Tabelle
 - **Lead-spezifische Ansicht**: Wähle einen einzelnen Lead um dessen Activity Timeline zu sehen
 - **Optimierte Performance**: Nutzt `campaignId` Filter für 50-100x schnellere Datenextraktion
+- **Activity Filtering**: Filtert automatisch irrelevante Activities (`hasEmailAddress`, `conditionChosen`)
+- **Duplicate Detection**: Dedupliziert `emailsOpened` (behebt Tracking-Pixel Mehrfach-Loads)
 - **Rate Limit Handling**: Automatisches Retry mit exponential backoff
 - **Pagination Support**: Holt automatisch alle Leads und Activities (keine Limitierung)
 - **User-Friendly UI**: Intuitive Streamlit-Oberfläche mit Progress-Anzeigen
@@ -157,7 +161,9 @@ Die App erstellt eine "Flat Table" mit folgenden Spalten:
 ### Buttons & Actions
 - **🔄 Aktivitäten aktualisieren**: Lädt nur neue Activities (schnell)
 - **🔁 Vollständig neu laden**: Löscht DB und lädt alles neu (bei Problemen)
-- **⬇️ Lead Details laden**: Fetcht HubSpot IDs für 50 weitere Leads
+- **⬇️ Alle Lead Details laden**: Fetcht HubSpot IDs für ALLE Leads automatisch (mit Progress Bar, Pause alle 50 Leads)
+- **⬆️ Nach HubSpot syncen**: Synchronisiert Engagement-Metriken zu HubSpot Custom Properties
+- **📥 Notes von HubSpot laden**: Lädt Lemlist Notes für Analyse und Duplikat-Erkennung
 - **🗑️ Datenbank leeren**: Löscht alle Campaign-Daten aus DB
 
 ## Fehlerbehandlung
@@ -196,13 +202,15 @@ Die App behandelt folgende Error-Szenarien:
 
 ```
 lemlist/
-├── app.py              # Hauptapplikation (Streamlit UI, LemlistClient)
-├── db.py               # Datenbank-Layer (LemlistDB, SQLite)
-├── requirements.txt    # Python Dependencies
-├── .env.example        # Template für API Config
-├── .gitignore         # Git ignore rules
-├── CLAUDE.md          # Claude Code Instruktionen
-└── README.md          # Diese Datei
+├── app.py                    # Hauptapplikation (Streamlit UI, LemlistClient)
+├── db.py                     # Datenbank-Layer (LemlistDB, SQLite)
+├── hubspot_client.py         # HubSpot API Client (Kontakte & Notes)
+├── hubspot_notes_analyzer.py # HubSpot Notes Parser & Duplikat-Erkennung
+├── requirements.txt          # Python Dependencies
+├── .env.example              # Template für API Config
+├── .gitignore               # Git ignore rules
+├── CLAUDE.md                # Claude Code Instruktionen
+└── README.md                # Diese Datei
 ```
 
 ### Testing
@@ -219,14 +227,52 @@ streamlit run app.py
 # - Cache-Funktionalität
 ```
 
+## HubSpot Integration
+
+### HubSpot Sync (Engagement Metriken)
+
+Die App kann aggregierte Engagement-Metriken aus der lokalen SQLite Datenbank zu HubSpot Custom Properties synchronisieren.
+
+**Setup**:
+1. HubSpot Private App erstellen: Settings → Integrations → Private Apps
+2. Scope: `crm.objects.contacts.write`
+3. Access Token in `.env` als `HUBSPOT_API_TOKEN` speichern
+
+**Synchronisierte Metriken**:
+- `lemlist_total_activities`: Gesamtanzahl Activities
+- `lemlist_engagement_score`: Berechneter Engagement Score (0-100)
+- `lemlist_lead_status`: Lead Status (new, cold, low/medium/high_engagement, bounced)
+- Und viele weitere (siehe CLAUDE.md für vollständige Liste)
+
+### HubSpot Notes Analyse
+
+Analysiert Lemlist Notes in HubSpot und findet/entfernt Duplikate:
+- **Notes laden**: Holt alle Lemlist-Notes für Leads in der Campaign
+- **Duplikat-Erkennung**: Findet Notes mit gleichem (Kontakt, Activity Type, Campaign, Step)
+- **Duplikate löschen**: Löscht Duplikate automatisch (behält neueste Note)
+- **DB-Vergleich**: Vergleicht Notes mit lokaler Datenbank für Vollständigkeitsprüfung
+
+## Activity Filtering & Deduplication
+
+### Gefilterte Activity Types
+Die folgenden Activity Types werden automatisch herausgefiltert (nicht nützlich für Analyse):
+- `hasEmailAddress`: Internes Lemlist-Event
+- `conditionChosen`: Workflow-Condition Event
+
+### emailsOpened Deduplication
+`emailsOpened` Activities werden dedupliziert basierend auf:
+- `leadEmail`
+- `emailTemplateId`
+- `sequenceStep`
+
+Dies behebt das Problem, dass Email-Clients den Tracking-Pixel mehrfach laden (z.B. bei Preview-Pane).
+
 ## Zukünftige Erweiterungen
 
 - **Webhook Integration**: Real-time Activity Updates statt Polling
 - **Multi-Campaign Support**: Mehrere Kampagnen gleichzeitig analysieren
 - **Data Visualization**: Charts für Activity Types und Zeitverläufe
 - **Export Formats**: Excel und JSON zusätzlich zu CSV
-- **HubSpot Sync**: Automatisches Sync aller Leads mit HubSpot IDs im Hintergrund
-- **Lead Scoring**: Automatische Berechnung von Engagement-Scores
 
 ## Lizenz
 

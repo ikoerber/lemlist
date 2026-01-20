@@ -7,10 +7,40 @@ incremental update support and background HubSpot/LinkedIn data fetching.
 
 import sqlite3
 import json
-from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from datetime import datetime, timezone
+from typing import List, Dict, Optional, Tuple, Any
 from contextlib import contextmanager
 import os
+
+# Engagement score weights for calculating lead engagement
+# Higher values indicate more positive engagement signals
+ENGAGEMENT_WEIGHTS = {
+    'emailsSent': 1,
+    'emailsOpened': 3,
+    'emailsBounced': -5,
+    'emailsClicked': 4,
+    'emailsReplied': 5,
+    'emailsFailed': -3,
+    'emailsUnsubscribed': -10,
+    'linkedinVisitDone': 2,
+    'linkedinInviteDone': 2,
+    'linkedinInviteAccepted': 5,
+    'linkedinSent': 2,
+    'linkedinOpened': 4,
+    'linkedinReplied': 5,
+    'aircallDone': 3,
+    'aircallAnswered': 5,
+    'manualDone': 2,
+    'apiDone': 1,
+    'paused': 0,
+    'resumed': 0,
+    'conditionChosen': 0,
+    'hooked': 3,
+    'interested': 10,
+    'notInterested': -5,
+    'skipped': -2,
+    'outOfOffice': 0,
+}
 
 
 class LemlistDB:
@@ -425,3 +455,173 @@ class LemlistDB:
             conn.execute("VACUUM")
         finally:
             conn.close()
+
+    # HubSpot Sync Operations
+
+    def get_all_leads_with_hubspot_ids(self, campaign_id: str) -> List[Dict]:
+        """Get all leads that have HubSpot IDs for sync.
+
+        Args:
+            campaign_id: Campaign to get leads for
+
+        Returns:
+            List of dicts with lead_id, email, hubspot_id, first_name, last_name
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT lead_id, email, hubspot_id, first_name, last_name
+                FROM leads
+                WHERE campaign_id = ?
+                AND hubspot_id IS NOT NULL
+                AND hubspot_id != ''
+            """, (campaign_id,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def calculate_lead_metrics(self, email: str, campaign_id: str) -> Optional[Dict[str, Any]]:
+        """Calculate aggregated metrics for a lead.
+
+        Computes engagement metrics from all activities for the given email
+        within the specified campaign.
+
+        Args:
+            email: Lead email address
+            campaign_id: Campaign ID for context (campaign name)
+
+        Returns:
+            Dict with all HubSpot property values, or None if no activities
+        """
+        # Get all activities for this email (across all campaigns for full picture)
+        activities = self.get_activities_by_email(email)
+
+        if not activities:
+            return None
+
+        # Parse dates and count by type
+        dates = []
+        type_counts = {}
+
+        for activity in activities:
+            # Parse created_at
+            created_at = activity.get('created_at')
+            if created_at:
+                try:
+                    dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                    dates.append(dt)
+                except (ValueError, AttributeError):
+                    pass
+
+            # Count by type
+            activity_type = activity.get('type', '')
+            type_counts[activity_type] = type_counts.get(activity_type, 0) + 1
+
+        if not dates:
+            return None
+
+        # Calculate date metrics
+        first_date = min(dates)
+        last_date = max(dates)
+        days_in_campaign = (datetime.now(first_date.tzinfo) - first_date).days if first_date.tzinfo else (datetime.now() - first_date).days
+
+        # Email metrics
+        emails_sent = type_counts.get('emailsSent', 0)
+        emails_opened = type_counts.get('emailsOpened', 0)
+        emails_bounced = type_counts.get('emailsBounced', 0)
+        emails_clicked = type_counts.get('emailsClicked', 0)
+        emails_replied = type_counts.get('emailsReplied', 0)
+
+        # Calculate open rate
+        email_open_rate = round((emails_opened / emails_sent) * 100, 1) if emails_sent > 0 else 0
+
+        # LinkedIn metrics
+        linkedin_visits = type_counts.get('linkedinVisitDone', 0)
+        linkedin_invites_sent = type_counts.get('linkedinInviteDone', 0)
+        linkedin_invites_accepted = type_counts.get('linkedinInviteAccepted', 0)
+        linkedin_messages_sent = type_counts.get('linkedinSent', 0)
+        linkedin_messages_opened = type_counts.get('linkedinOpened', 0)
+
+        # Calculate engagement score
+        engagement_score = 0
+        for activity in activities:
+            activity_type = activity.get('type', '')
+            engagement_score += ENGAGEMENT_WEIGHTS.get(activity_type, 0)
+
+        # Normalize score to 0-100 range (cap at 100)
+        engagement_score = min(max(engagement_score, 0), 100)
+
+        # Determine lead status based on engagement and bounces
+        if emails_bounced > 0:
+            lead_status = 'bounced'
+        elif engagement_score >= 30:
+            lead_status = 'high_engagement'
+        elif engagement_score >= 15:
+            lead_status = 'medium_engagement'
+        elif engagement_score >= 5:
+            lead_status = 'low_engagement'
+        elif len(activities) <= 2:
+            lead_status = 'new'
+        else:
+            lead_status = 'cold'
+
+        # Get campaign name
+        campaign = self.get_campaign(campaign_id)
+        campaign_name = campaign['name'] if campaign else f"Campaign {campaign_id}"
+
+        # Format dates for HubSpot (Unix timestamp in milliseconds at midnight UTC)
+        def format_date_as_timestamp(dt: datetime) -> int:
+            """Format date as Unix timestamp in milliseconds at midnight UTC for HubSpot"""
+            # HubSpot expects dates as timestamps at midnight UTC
+            # Convert to UTC if timezone-aware, otherwise assume UTC
+            if dt.tzinfo is not None:
+                dt_utc = dt.astimezone(timezone.utc)
+            else:
+                dt_utc = dt.replace(tzinfo=timezone.utc)
+            # Create midnight UTC for the date
+            midnight_utc = datetime(dt_utc.year, dt_utc.month, dt_utc.day, 0, 0, 0, tzinfo=timezone.utc)
+            return int(midnight_utc.timestamp() * 1000)
+
+        def format_datetime_as_timestamp(dt: datetime) -> int:
+            """Format datetime as Unix timestamp in milliseconds for HubSpot"""
+            return int(dt.timestamp() * 1000)
+
+        # Find last email opened date
+        last_email_opened_date = None
+        for activity in sorted(activities, key=lambda a: a.get('created_at', ''), reverse=True):
+            if activity.get('type') == 'emailsOpened':
+                try:
+                    last_email_opened_date = datetime.fromisoformat(
+                        activity['created_at'].replace('Z', '+00:00')
+                    )
+                    break
+                except (ValueError, AttributeError, KeyError):
+                    pass
+
+        return {
+            # Core metrics
+            'lemlist_total_activities': len(activities),
+            'lemlist_first_activity_date': format_date_as_timestamp(first_date),
+            'lemlist_last_activity_date': format_date_as_timestamp(last_date),
+            'lemlist_days_in_campaign': days_in_campaign,
+            'lemlist_current_campaign': campaign_name,
+
+            # Email metrics
+            'lemlist_emails_sent': emails_sent,
+            'lemlist_emails_opened': emails_opened,
+            'lemlist_emails_bounced': emails_bounced,
+            'lemlist_emails_clicked': emails_clicked,
+            'lemlist_emails_replied': emails_replied,
+            'lemlist_email_open_rate': email_open_rate,
+            'lemlist_last_email_opened_date': format_date_as_timestamp(last_email_opened_date) if last_email_opened_date else None,
+
+            # LinkedIn metrics
+            'lemlist_linkedin_visits': linkedin_visits,
+            'lemlist_linkedin_invites_sent': linkedin_invites_sent,
+            'lemlist_linkedin_invites_accepted': linkedin_invites_accepted,
+            'lemlist_linkedin_messages_sent': linkedin_messages_sent,
+            'lemlist_linkedin_messages_opened': linkedin_messages_opened,
+
+            # Engagement
+            'lemlist_engagement_score': engagement_score,
+            'lemlist_lead_status': lead_status,
+            'lemlist_last_sync_date': format_date_as_timestamp(datetime.now(timezone.utc)),  # HubSpot date fields require midnight UTC
+        }
