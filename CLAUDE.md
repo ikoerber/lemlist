@@ -55,7 +55,8 @@ All API requests require ONLY an API key (no User ID or Email needed):
    - Returns all activities for the entire campaign
    - Supports pagination with `limit` and `offset`
    - Activity types include: emailsSent, emailsOpened, linkedinVisitDone, conditionChosen, etc.
-   - **Contains lead data**: leadEmail, leadFirstName, leadLastName, linkedinUrl
+   - **Contains lead data**: `leadId`, leadEmail, leadFirstName, leadLastName, linkedinUrl
+   - **`leadId`**: Unique Lemlist ID for the lead (e.g., `lea_xxx`) - used as PRIMARY KEY
    - **Does NOT contain**: hubspotLeadId (must fetch separately)
 
 3. **Get Lead Details** (for HubSpot ID enrichment)
@@ -74,28 +75,32 @@ All API requests require ONLY an API key (no User ID or Email needed):
 ### Database Schema (SQLite)
 
 **campaigns table**:
-- `id` (TEXT PRIMARY KEY): Campaign ID
+- `campaign_id` (TEXT PRIMARY KEY): Lemlist Campaign ID
 - `name` (TEXT): Campaign name
 - `status` (TEXT): Campaign status
-- `last_sync` (DATETIME): Last sync timestamp
+- `last_updated` (DATETIME): Last sync timestamp
 
 **leads table**:
-- `email` (TEXT PRIMARY KEY): Lead email
-- `campaign_id` (TEXT): Associated campaign
+- `lead_id` (TEXT PRIMARY KEY): Lemlist Lead ID (e.g., `lea_xxx`)
+- `email` (TEXT NOT NULL): Lead email address
+- `campaign_id` (TEXT NOT NULL): Associated campaign (FK)
 - `first_name`, `last_name` (TEXT): Lead names
 - `hubspot_id` (TEXT): HubSpot contact ID (nullable)
 - `linkedin_url` (TEXT): LinkedIn profile URL (nullable)
 - `last_updated` (DATETIME): Last update timestamp
 
+**Note**: Using `lead_id` as PRIMARY KEY allows the same email to exist in multiple campaigns (each with a unique `lead_id`). This is how Lemlist models leads internally.
+
 **activities table**:
-- `id` (TEXT PRIMARY KEY): Activity ID
-- `lead_email` (TEXT): Foreign key to leads
-- `campaign_id` (TEXT): Associated campaign
+- `id` (TEXT PRIMARY KEY): Activity ID from Lemlist
+- `lead_id` (TEXT NOT NULL): Foreign key to leads.lead_id
+- `lead_email` (TEXT NOT NULL): Lead email (denormalized for convenience)
+- `campaign_id` (TEXT NOT NULL): Associated campaign (FK)
 - `type` (TEXT): Raw activity type
 - `type_display` (TEXT): Translated/formatted type
 - `created_at` (DATETIME): Activity timestamp
 - `details` (TEXT): Extracted details (subject, URL, etc.)
-- `raw_data` (TEXT): Full JSON payload
+- `raw_json` (TEXT): Full JSON payload
 
 ### Output Format
 The app produces a flat table where each row represents a single activity:
@@ -179,13 +184,17 @@ Session-based HTTP client with Basic Auth:
 SQLite database layer for local caching:
 - `get_connection()`: Context manager for DB connections
 - `upsert_campaign()`: Insert/update campaign record
-- `upsert_leads()`: Bulk insert/update leads (extracts hubspot_id, linkedin_url)
-- `upsert_activities()`: Bulk insert/update activities
-- `get_activities_by_campaign()`: Returns activities with LEFT JOIN on leads (includes lead names, hubspot_id, linkedin_url)
+- `upsert_leads()`: Bulk insert/update leads using `lead_id` as key (extracts hubspot_id, linkedin_url)
+- `upsert_activities()`: Bulk insert/update activities (requires `leadId` for FK)
+- `get_activities_by_campaign()`: Returns activities with LEFT JOIN on leads via `lead_id`
+- `get_activities_by_lead(lead_id)`: Get all activities for a specific lead
+- `get_activities_by_email(email)`: Get all activities across campaigns for an email (for HubSpot sync)
 - `get_campaign_stats()`: Returns metrics (lead count, activity count, hubspot coverage)
 - `get_latest_activity_date()`: Returns timestamp of newest activity (for incremental updates)
-- `get_leads_without_hubspot_id()`: Returns emails that need HubSpot ID enrichment
-- `update_lead_details()`: Updates hubspot_id and linkedin_url for a single lead
+- `get_leads_without_hubspot_id()`: Returns list of dicts with `lead_id` and `email` needing enrichment
+- `get_lead(lead_id)`: Get lead by Lemlist lead_id
+- `get_lead_by_email(email, campaign_id)`: Get lead by email within a specific campaign
+- `update_lead_details(lead_id)`: Updates hubspot_id and linkedin_url for a lead by lead_id
 - `clear_campaign_data()`: Deletes all data for a campaign
 
 ### Core Functions (`app.py`)
@@ -195,9 +204,9 @@ Main sync logic with two modes:
 
 1. **First Load / Full Reload**:
    - Fetch ALL activities from API (pagination)
-   - Extract leads from activities (leadEmail, leadFirstName, leadLastName, linkedinUrl)
+   - Extract leads from activities using `leadId` as unique key (also: leadEmail, leadFirstName, etc.)
    - Fetch HubSpot IDs for first 50 leads via `/leads/{email}` (0.15s delay between calls)
-   - Save leads and activities to DB
+   - Save leads and activities to DB (using lead_id as FK)
    - Return data from DB
 
 2. **Incremental Update**:

@@ -241,18 +241,25 @@ class LemlistClient:
 def extract_leads_from_activities(activities: List[Dict]) -> List[Dict]:
     """Extract unique leads from activities response.
 
+    Uses leadId as the unique key (not email) since the same email
+    can exist in multiple campaigns with different leadIds.
+
     Args:
         activities: List of activity dicts from Lemlist API
 
     Returns:
-        List of lead dicts with email, firstName, lastName, linkedinUrl, etc.
+        List of lead dicts with leadId, email, firstName, lastName, etc.
     """
     leads_dict = {}
 
     for activity in activities:
+        lead_id = activity.get('leadId')
         email = activity.get('leadEmail') or activity.get('email')
-        if email and email not in leads_dict:
-            leads_dict[email] = {
+
+        # leadId is required for the new schema
+        if lead_id and lead_id not in leads_dict:
+            leads_dict[lead_id] = {
+                'leadId': lead_id,
                 'email': email,
                 'firstName': activity.get('leadFirstName') or activity.get('firstName'),
                 'lastName': activity.get('leadLastName') or activity.get('lastName'),
@@ -579,7 +586,7 @@ def fetch_lead_details_batch(api_key: str, campaign_id: str, batch_size: int = 1
     db = LemlistDB()
     client = LemlistClient(api_key)
 
-    # Get leads without HubSpot ID
+    # Get leads without HubSpot ID (returns list of dicts with lead_id and email)
     leads_to_fetch = db.get_leads_without_hubspot_id(campaign_id, limit=batch_size)
 
     if not leads_to_fetch:
@@ -589,7 +596,10 @@ def fetch_lead_details_batch(api_key: str, campaign_id: str, batch_size: int = 1
     success = 0
     failed = 0
 
-    for email in leads_to_fetch:
+    for lead_info in leads_to_fetch:
+        lead_id = lead_info['lead_id']
+        email = lead_info['email']
+
         try:
             lead_details = client.get_lead_details(email)
             hubspot_id = lead_details.get('hubspotLeadId', None)
@@ -599,8 +609,8 @@ def fetch_lead_details_batch(api_key: str, campaign_id: str, batch_size: int = 1
                           lead_details.get('linkedInUrl') or
                           None)
 
-            # Update DB
-            db.update_lead_details(email, hubspot_id=hubspot_id, linkedin_url=linkedin_url)
+            # Update DB using lead_id as identifier
+            db.update_lead_details(lead_id, hubspot_id=hubspot_id, linkedin_url=linkedin_url)
 
             processed += 1
             if hubspot_id or linkedin_url:
@@ -610,7 +620,7 @@ def fetch_lead_details_batch(api_key: str, campaign_id: str, batch_size: int = 1
             time.sleep(0.15)
 
         except Exception as e:
-            logger.warning(f"Failed to fetch details for {email}: {e}")
+            logger.warning(f"Failed to fetch details for {email} (lead_id={lead_id}): {e}")
             processed += 1
             failed += 1
 
@@ -930,22 +940,29 @@ def main():
                             db = LemlistDB()
                             client = LemlistClient(api_key)
 
-                            lead_details = client.get_lead_details(selected_lead)
-                            hubspot_id = lead_details.get('hubspotLeadId', None)
-                            linkedin_url = (lead_details.get('linkedinUrl') or
-                                          lead_details.get('linkedinPublicUrl') or
-                                          lead_details.get('linkedin') or
-                                          lead_details.get('linkedInUrl') or
-                                          None)
+                            # First, get lead_id from DB
+                            lead_record = db.get_lead_by_email(selected_lead, campaign_id)
+                            if not lead_record:
+                                st.warning("⚠️ Lead nicht in Datenbank gefunden")
+                            else:
+                                lead_id = lead_record['lead_id']
 
-                            # Update DB
-                            if hubspot_id or linkedin_url:
-                                db.update_lead_details(selected_lead, hubspot_id=hubspot_id, linkedin_url=linkedin_url)
-                                # Reload data from DB to get updated links
-                                df = load_campaign_data_from_db(campaign_id)
-                                st.session_state.df = df
-                                filtered_df = df[df['Lead Email'] == selected_lead]
-                                st.success("✅ Lead Details geladen")
+                                lead_details = client.get_lead_details(selected_lead)
+                                hubspot_id = lead_details.get('hubspotLeadId', None)
+                                linkedin_url = (lead_details.get('linkedinUrl') or
+                                              lead_details.get('linkedinPublicUrl') or
+                                              lead_details.get('linkedin') or
+                                              lead_details.get('linkedInUrl') or
+                                              None)
+
+                                # Update DB using lead_id
+                                if hubspot_id or linkedin_url:
+                                    db.update_lead_details(lead_id, hubspot_id=hubspot_id, linkedin_url=linkedin_url)
+                                    # Reload data from DB to get updated links
+                                    df = load_campaign_data_from_db(campaign_id)
+                                    st.session_state.df = df
+                                    filtered_df = df[df['Lead Email'] == selected_lead]
+                                    st.success("✅ Lead Details geladen")
                     except Exception as e:
                         st.warning(f"⚠️ Konnte Lead Details nicht laden: {str(e)}")
 

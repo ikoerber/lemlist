@@ -55,10 +55,12 @@ class LemlistDB:
                 )
             """)
 
-            # Leads table
+            # Leads table - lead_id from Lemlist is PRIMARY KEY
+            # This allows same email in multiple campaigns (each with unique lead_id)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS leads (
-                    email TEXT PRIMARY KEY,
+                    lead_id TEXT PRIMARY KEY,
+                    email TEXT NOT NULL,
                     campaign_id TEXT NOT NULL,
                     first_name TEXT,
                     last_name TEXT,
@@ -70,10 +72,11 @@ class LemlistDB:
                 )
             """)
 
-            # Activities table
+            # Activities table - references lead_id instead of email
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS activities (
                     id TEXT PRIMARY KEY,
+                    lead_id TEXT NOT NULL,
                     lead_email TEXT NOT NULL,
                     campaign_id TEXT NOT NULL,
                     type TEXT NOT NULL,
@@ -82,7 +85,7 @@ class LemlistDB:
                     details TEXT,
                     raw_json TEXT,
                     synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (lead_email) REFERENCES leads(email),
+                    FOREIGN KEY (lead_id) REFERENCES leads(lead_id),
                     FOREIGN KEY (campaign_id) REFERENCES campaigns(campaign_id)
                 )
             """)
@@ -93,7 +96,11 @@ class LemlistDB:
                 ON activities(campaign_id)
             """)
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_activities_lead
+                CREATE INDEX IF NOT EXISTS idx_activities_lead_id
+                ON activities(lead_id)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_activities_lead_email
                 ON activities(lead_email)
             """)
             cursor.execute("""
@@ -103,6 +110,10 @@ class LemlistDB:
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_leads_campaign
                 ON leads(campaign_id)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_leads_email
+                ON leads(email)
             """)
 
     # Campaign Operations
@@ -140,12 +151,22 @@ class LemlistDB:
     # Lead Operations
 
     def upsert_leads(self, leads: List[Dict], campaign_id: str):
-        """Insert or update multiple leads"""
+        """Insert or update multiple leads.
+
+        Uses lead_id (from Lemlist) as primary key. This allows the same
+        email to exist in multiple campaigns with different lead_ids.
+        """
         with self.get_connection() as conn:
             cursor = conn.cursor()
             now = datetime.now()
 
             for lead in leads:
+                # lead_id and email are required - skip leads without them
+                lead_id = lead.get('leadId') or lead.get('lead_id')
+                email = lead.get('email')
+                if not lead_id or not email:
+                    continue
+
                 # Extract HubSpot and LinkedIn data if present
                 hubspot_id = lead.get('hubspotLeadId') or lead.get('hubspot_id')
                 linkedin_url = (lead.get('linkedinUrl') or
@@ -155,17 +176,19 @@ class LemlistDB:
 
                 cursor.execute("""
                     INSERT INTO leads (
-                        email, campaign_id, first_name, last_name,
+                        lead_id, email, campaign_id, first_name, last_name,
                         hubspot_id, linkedin_url, last_updated
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(email) DO UPDATE SET
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(lead_id) DO UPDATE SET
+                        email = excluded.email,
                         first_name = excluded.first_name,
                         last_name = excluded.last_name,
                         hubspot_id = COALESCE(excluded.hubspot_id, leads.hubspot_id),
                         linkedin_url = COALESCE(excluded.linkedin_url, leads.linkedin_url),
                         last_updated = excluded.last_updated
                 """, (
+                    lead_id,
                     lead.get('email'),
                     campaign_id,
                     lead.get('firstName'),
@@ -175,9 +198,14 @@ class LemlistDB:
                     now
                 ))
 
-    def update_lead_details(self, email: str, hubspot_id: Optional[str] = None,
+    def update_lead_details(self, lead_id: str, hubspot_id: Optional[str] = None,
                            linkedin_url: Optional[str] = None):
         """Update HubSpot ID and/or LinkedIn URL for a lead.
+
+        Args:
+            lead_id: Lemlist lead ID (primary key)
+            hubspot_id: Optional HubSpot contact ID
+            linkedin_url: Optional LinkedIn profile URL
 
         Uses a single UPDATE statement with COALESCE to only update
         non-NULL values while preserving existing data.
@@ -192,16 +220,30 @@ class LemlistDB:
                 SET hubspot_id = COALESCE(?, hubspot_id),
                     linkedin_url = COALESCE(?, linkedin_url),
                     last_updated = ?
-                WHERE email = ?
-            """, (hubspot_id, linkedin_url, datetime.now(), email))
+                WHERE lead_id = ?
+            """, (hubspot_id, linkedin_url, datetime.now(), lead_id))
 
-    def get_lead(self, email: str) -> Optional[Dict]:
-        """Get lead by email"""
+    def get_lead(self, lead_id: str) -> Optional[Dict]:
+        """Get lead by lead_id"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT * FROM leads WHERE email = ?
-            """, (email,))
+                SELECT * FROM leads WHERE lead_id = ?
+            """, (lead_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_lead_by_email(self, email: str, campaign_id: str) -> Optional[Dict]:
+        """Get lead by email and campaign_id.
+
+        Since email is not unique (same email can be in multiple campaigns),
+        we need campaign_id to uniquely identify the lead.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM leads WHERE email = ? AND campaign_id = ?
+            """, (email, campaign_id))
             row = cursor.fetchone()
             return dict(row) if row else None
 
@@ -214,34 +256,45 @@ class LemlistDB:
             """, (campaign_id,))
             return [dict(row) for row in cursor.fetchall()]
 
-    def get_leads_without_hubspot_id(self, campaign_id: str, limit: int = 100) -> List[str]:
-        """Get emails of leads that don't have HubSpot ID yet"""
+    def get_leads_without_hubspot_id(self, campaign_id: str, limit: int = 100) -> List[Dict]:
+        """Get leads that don't have HubSpot ID yet.
+
+        Returns list of dicts with lead_id and email for fetching HubSpot IDs.
+        """
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT email FROM leads
+                SELECT lead_id, email FROM leads
                 WHERE campaign_id = ? AND hubspot_id IS NULL
                 LIMIT ?
             """, (campaign_id, limit))
-            return [row['email'] for row in cursor.fetchall()]
+            return [{'lead_id': row['lead_id'], 'email': row['email']} for row in cursor.fetchall()]
 
     # Activity Operations
 
     def upsert_activities(self, activities: List[Dict], campaign_id: str):
-        """Insert or update multiple activities"""
+        """Insert or update multiple activities.
+
+        Each activity must have a leadId for proper foreign key relationship.
+        """
         with self.get_connection() as conn:
             cursor = conn.cursor()
 
             for activity in activities:
                 # Generate activity ID if not present
-                activity_id = activity.get('_id', f"{activity.get('leadEmail')}_{activity.get('createdAt')}")
+                activity_id = activity.get('_id', f"{activity.get('leadId')}_{activity.get('createdAt')}")
+
+                # lead_id is required for FK relationship
+                lead_id = activity.get('leadId')
+                if not lead_id:
+                    continue
 
                 cursor.execute("""
                     INSERT INTO activities (
-                        id, lead_email, campaign_id, type, type_display,
+                        id, lead_id, lead_email, campaign_id, type, type_display,
                         created_at, details, raw_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         type_display = excluded.type_display,
                         details = excluded.details,
@@ -249,6 +302,7 @@ class LemlistDB:
                         synced_at = CURRENT_TIMESTAMP
                 """, (
                     activity_id,
+                    lead_id,
                     activity.get('leadEmail'),
                     campaign_id,
                     activity.get('type'),
@@ -270,14 +324,28 @@ class LemlistDB:
                     l.hubspot_id as lead_hubspot_id,
                     l.linkedin_url as lead_linkedin_url
                 FROM activities a
-                LEFT JOIN leads l ON a.lead_email = l.email
+                LEFT JOIN leads l ON a.lead_id = l.lead_id
                 WHERE a.campaign_id = ?
                 ORDER BY a.created_at ASC
             """, (campaign_id,))
             return [dict(row) for row in cursor.fetchall()]
 
-    def get_activities_by_lead(self, email: str) -> List[Dict]:
-        """Get all activities for a specific lead"""
+    def get_activities_by_lead(self, lead_id: str) -> List[Dict]:
+        """Get all activities for a specific lead by lead_id"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM activities
+                WHERE lead_id = ?
+                ORDER BY created_at ASC
+            """, (lead_id,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_activities_by_email(self, email: str) -> List[Dict]:
+        """Get all activities for a specific email (across all campaigns).
+
+        Used for calculating metrics across all campaigns for HubSpot sync.
+        """
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
