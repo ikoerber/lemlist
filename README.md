@@ -6,10 +6,13 @@ Eine robuste Streamlit-App zum Extrahieren und Analysieren von Leads und Activit
 
 - **Campaign Dropdown**: Wähle Campaign aus Liste statt manuelle ID-Eingabe
 - **Status Filter**: Zeige nur aktive, Draft oder pausierte Campaigns
+- **SQLite Datenbank**: Lokales Caching aller Daten für schnellen Zugriff
+- **Incremental Updates**: Lädt nur neue Activities seit letztem Sync
+- **HubSpot Integration**: Automatisches Fetching von HubSpot IDs mit klickbaren Links
+- **LinkedIn URLs**: Klickbare LinkedIn Profile direkt in der Tabelle
 - **Lead-spezifische Ansicht**: Wähle einen einzelnen Lead um dessen Activity Timeline zu sehen
 - **Optimierte Performance**: Nutzt `campaignId` Filter für 50-100x schnellere Datenextraktion
 - **Rate Limit Handling**: Automatisches Retry mit exponential backoff
-- **Smart Caching**: 1-Stunde TTL für wiederholte Analysen
 - **Pagination Support**: Holt automatisch alle Leads und Activities (keine Limitierung)
 - **User-Friendly UI**: Intuitive Streamlit-Oberfläche mit Progress-Anzeigen
 - **CSV Export**: Zeitgestempelte Exports für einfache Weiterverarbeitung
@@ -107,6 +110,8 @@ Die App erstellt eine "Flat Table" mit folgenden Spalten:
 | Activity Type | Art der Aktivität (z.B. emailOpened, linkedinVisit) |
 | Activity Date | Datum und Uhrzeit (Format: YYYY-MM-DD HH:MM) |
 | Details | Zusätzliche Details (Subject, URL, Payload) |
+| HubSpot Link | Klickbarer Link zum HubSpot Kontakt (falls verfügbar) |
+| LinkedIn Link | Klickbarer Link zum LinkedIn Profil (falls verfügbar) |
 
 ## API Limits und Performance
 
@@ -129,20 +134,31 @@ Die App erstellt eine "Flat Table" mit folgenden Spalten:
 
 ## Architektur
 
-### LemlistClient
+### LemlistClient (`app.py`)
 - Zentraler API Client mit Session-Management
 - Rate Limit Handling und Retry Logic
-- Automatische Pagination für Leads und Activities
+- Automatische Pagination für Activities und Campaigns
+- `get_all_activities()`: Holt alle Activities mit `campaignId` Filter
+- `get_lead_details()`: Holt HubSpot IDs für einzelne Leads
+- `get_all_campaigns()`: Lädt Campaign-Liste für Dropdown
 
-### Data Processing
-- Merge von Leads und Activities auf Email-Basis
-- Extraktion relevanter Details aus Activity Payloads
-- Datumsformatierung und Sortierung
+### LemlistDB (`db.py`)
+- SQLite Datenbank-Layer für lokales Caching
+- Tabellen: `campaigns`, `leads`, `activities`
+- `upsert_*()` Methoden für idempotente Speicherung
+- `get_activities_by_campaign()`: LEFT JOIN von Activities mit Lead-Daten
+- Incremental Updates durch Timestamp-Tracking
 
-### Caching
-- Streamlit `@st.cache_data` mit 1-Stunde TTL
-- Verhindert redundante API Calls bei wiederholten Analysen
-- Manuelles Cache-Leeren über UI möglich
+### Data Flow
+1. **First Load**: Activities von API → Leads extrahieren → HubSpot IDs fetchen (erste 50) → DB speichern
+2. **Incremental Update**: Neue Activities seit letztem Sync → Neue Leads extrahieren → HubSpot IDs fetchen → DB updaten
+3. **Display**: Daten aus DB laden (JOIN) → Streamlit DataFrame → Filter anwenden → Anzeigen/Exportieren
+
+### Buttons & Actions
+- **🔄 Aktivitäten aktualisieren**: Lädt nur neue Activities (schnell)
+- **🔁 Vollständig neu laden**: Löscht DB und lädt alles neu (bei Problemen)
+- **⬇️ Lead Details laden**: Fetcht HubSpot IDs für 50 weitere Leads
+- **🗑️ Datenbank leeren**: Löscht alle Campaign-Daten aus DB
 
 ## Fehlerbehandlung
 
@@ -180,7 +196,8 @@ Die App behandelt folgende Error-Szenarien:
 
 ```
 lemlist/
-├── app.py              # Hauptapplikation
+├── app.py              # Hauptapplikation (Streamlit UI, LemlistClient)
+├── db.py               # Datenbank-Layer (LemlistDB, SQLite)
 ├── requirements.txt    # Python Dependencies
 ├── .env.example        # Template für API Config
 ├── .gitignore         # Git ignore rules
@@ -208,7 +225,8 @@ streamlit run app.py
 - **Multi-Campaign Support**: Mehrere Kampagnen gleichzeitig analysieren
 - **Data Visualization**: Charts für Activity Types und Zeitverläufe
 - **Export Formats**: Excel und JSON zusätzlich zu CSV
-- **Incremental Updates**: Nur neue Activities seit letztem Fetch laden
+- **HubSpot Sync**: Automatisches Sync aller Leads mit HubSpot IDs im Hintergrund
+- **Lead Scoring**: Automatische Berechnung von Engagement-Scores
 
 ## Lizenz
 
