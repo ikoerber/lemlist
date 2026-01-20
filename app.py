@@ -7,9 +7,40 @@ import os
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
 from db import LemlistDB
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Activity type mapping for German display names
+ACTIVITY_TYPE_MAP = {
+    'emailsSent': 'Email gesendet',
+    'emailsOpened': 'Email geöffnet',
+    'emailsClicked': 'Email geklickt',
+    'emailsReplied': 'Email beantwortet',
+    'emailsBounced': 'Email bounced',
+    'emailsFailed': 'Email fehlgeschlagen',
+    'emailsUnsubscribed': 'Abgemeldet',
+    'linkedinVisitDone': 'LinkedIn Besuch',
+    'linkedinSent': 'LinkedIn Nachricht gesendet',
+    'linkedinOpened': 'LinkedIn geöffnet',
+    'linkedinReplied': 'LinkedIn beantwortet',
+    'linkedinInviteDone': 'LinkedIn Einladung gesendet',
+    'linkedinInviteAccepted': 'LinkedIn Einladung akzeptiert',
+    'outOfOffice': 'Abwesenheit',
+    'skipped': 'Übersprungen',
+}
+
+
+# ============================================================================
 # Custom Exceptions
+# ============================================================================
 class UnauthorizedError(Exception):
     pass
 
@@ -120,33 +151,6 @@ class LemlistClient:
 
             raise Exception(f"Ungültige JSON Response von {endpoint}: {str(e)}")
 
-    def get_all_leads(self, campaign_id: str) -> List[Dict]:
-        """Fetch all leads for a campaign with pagination"""
-        all_leads = []
-        offset = 0
-        limit = 100
-
-        while True:
-            params = {'limit': limit, 'offset': offset}
-            response = self._make_request(f"/campaigns/{campaign_id}/leads", params)
-
-            leads = self._parse_json_response(response, f"/campaigns/{campaign_id}/leads")
-            if not leads or len(leads) == 0:
-                break
-
-            all_leads.extend(leads)
-
-            # If we got fewer results than limit, we've reached the end
-            if len(leads) < limit:
-                break
-
-            offset += limit
-
-            # Small delay to respect rate limits (20 req/2sec = 0.1s per request)
-            time.sleep(0.1)
-
-        return all_leads
-
     def get_all_activities(self, campaign_id: str) -> List[Dict]:
         """Fetch all activities for a campaign with pagination"""
         all_activities = []
@@ -230,147 +234,108 @@ class LemlistClient:
         return all_campaigns
 
 
-# Data Processing Functions
-def merge_leads_activities(leads: List[Dict], activities: List[Dict]) -> pd.DataFrame:
-    """Merge leads and activities into a flat table"""
+# ============================================================================
+# Helper Functions for Data Processing
+# ============================================================================
 
-    # Convert leads to DataFrame
-    leads_df = pd.DataFrame(leads)
+def extract_leads_from_activities(activities: List[Dict]) -> List[Dict]:
+    """Extract unique leads from activities response.
 
-    # Extract key fields from leads (handle missing fields gracefully)
-    # Leads API uses firstName and lastName (without "lead" prefix)
-    # Activities API uses leadFirstName and leadLastName (with "lead" prefix)
-    # NOTE: HubSpot ID is NOT included here - it's fetched on-demand when viewing a lead
-    leads_clean = pd.DataFrame({
-        'email': leads_df['email'] if 'email' in leads_df.columns else pd.Series(dtype='str'),
-        'firstName': leads_df['firstName'] if 'firstName' in leads_df.columns else pd.Series(dtype='str'),
-        'lastName': leads_df['lastName'] if 'lastName' in leads_df.columns else pd.Series(dtype='str')
-    })
+    Args:
+        activities: List of activity dicts from Lemlist API
 
-    # Convert activities to DataFrame
-    if not activities:
-        # Return empty DataFrame with correct structure
-        return pd.DataFrame(columns=[
-            'Lead Email', 'Lead FirstName', 'Lead LastName',
-            'Activity Type', 'Activity Date', 'Details'
-        ])
+    Returns:
+        List of lead dicts with email, firstName, lastName, linkedinUrl, etc.
+    """
+    leads_dict = {}
 
-    activities_df = pd.DataFrame(activities)
-
-    # Extract key fields from activities
-    # Activities already contain ALL lead information (leadEmail, leadFirstName, leadLastName)
-    activities_clean = pd.DataFrame({
-        'email': activities_df['leadEmail'] if 'leadEmail' in activities_df.columns else pd.Series(dtype='str'),
-        'firstName': activities_df['leadFirstName'] if 'leadFirstName' in activities_df.columns else pd.Series(dtype='str'),
-        'lastName': activities_df['leadLastName'] if 'leadLastName' in activities_df.columns else pd.Series(dtype='str'),
-        'type': activities_df['type'] if 'type' in activities_df.columns else pd.Series(dtype='str'),
-        'isFirst': activities_df['isFirst'] if 'isFirst' in activities_df.columns else pd.Series(dtype='bool'),
-        'createdAt': activities_df['createdAt'] if 'createdAt' in activities_df.columns else pd.Series(dtype='str')
-    })
-
-    # Create display type for conditionChosen with label
-    def get_display_type(row):
-        """Get display-friendly activity type"""
-        activity_type = row.get('type', '')
-        if pd.isna(activity_type):
-            return ''
-
-        # For conditionChosen, show only the label (without "conditionChosen:" prefix)
-        if activity_type == 'conditionChosen':
-            label = row.get('conditionLabel', 'Bedingung erfüllt')
-            return label
-
-        # Map common activity types to German readable names
-        activity_map = {
-            'emailsSent': 'Email gesendet',
-            'emailsOpened': 'Email geöffnet',
-            'emailsClicked': 'Email geklickt',
-            'emailsReplied': 'Email beantwortet',
-            'emailsBounced': 'Email bounced',
-            'emailsFailed': 'Email fehlgeschlagen',
-            'emailsUnsubscribed': 'Abgemeldet',
-            'linkedinVisitDone': 'LinkedIn Besuch',
-            'linkedinSent': 'LinkedIn Nachricht gesendet',
-            'linkedinOpened': 'LinkedIn geöffnet',
-            'linkedinReplied': 'LinkedIn beantwortet',
-        }
-
-        return activity_map.get(activity_type, activity_type)  # Fallback to original if not in map
-
-    activities_clean['type_display'] = activities_df.apply(get_display_type, axis=1)
-
-    # Try to extract details/payload (structure varies by activity type)
-    def extract_details(row):
-        """Extract meaningful details from activity"""
-        if pd.isna(row.get('type')):
-            return ''
-
-        # Special handling for conditionChosen activities
-        if row.get('type') == 'conditionChosen':
-            label = row.get('conditionLabel', 'Unbekannt')
-            value = row.get('conditionValue', None)
-            if value is not None:
-                result = 'Ja ✓' if value else 'Nein ✗'
-                return f"Bedingung: {label} → Erfüllt: {result}"
-            else:
-                return f"Bedingung: {label}"
-
-        # Try to get subject, url, or other meaningful data
-        if 'subject' in row:
-            return str(row['subject'])
-        elif 'url' in row:
-            return str(row['url'])
-        elif 'message' in row:
-            return str(row['message'])
-        else:
-            # Return JSON representation of the row, excluding common fields
-            exclude = {
-                'email', 'leadEmail', 'type', 'isFirst', 'createdAt', '_id',
-                'campaignId', 'campaignName', 'conditionLabel', 'conditionValue',
-                'leadFirstName', 'leadLastName', 'leadCompanyName'
+    for activity in activities:
+        email = activity.get('leadEmail') or activity.get('email')
+        if email and email not in leads_dict:
+            leads_dict[email] = {
+                'email': email,
+                'firstName': activity.get('leadFirstName') or activity.get('firstName'),
+                'lastName': activity.get('leadLastName') or activity.get('lastName'),
+                'hubspotLeadId': activity.get('hubspotLeadId'),
+                'linkedinUrl': (activity.get('linkedinUrl') or
+                               activity.get('linkedinUrlSalesNav') or
+                               activity.get('linkedinPublicUrl')),
+                'companyName': activity.get('leadCompanyName') or activity.get('companyName'),
+                'jobTitle': activity.get('jobTitle'),
+                'phone': activity.get('leadPhone') or activity.get('phone'),
+                'location': activity.get('location'),
             }
-            details = {k: v for k, v in row.items() if k not in exclude and pd.notna(v)}
-            return str(details) if details else ''
 
-    activities_clean['details'] = activities_df.apply(extract_details, axis=1)
+    return list(leads_dict.values())
 
-    # Format dates
-    def format_date(date_str):
-        """Format ISO date to YYYY-MM-DD HH:MM"""
-        if pd.isna(date_str):
-            return ''
-        try:
-            dt = pd.to_datetime(date_str)
-            return dt.strftime('%Y-%m-%d %H:%M')
-        except:
-            return str(date_str)
 
-    activities_clean['formatted_date'] = activities_clean['createdAt'].apply(format_date)
+def get_activity_display_type(activity: Dict) -> str:
+    """Get German display name for activity type.
 
-    # Keep datetime object for proper sorting
-    activities_clean['datetime_obj'] = pd.to_datetime(activities_clean['createdAt'], errors='coerce')
+    Args:
+        activity: Activity dict from Lemlist API
 
-    # Note: No merge needed anymore! Activities already contain all lead data
-    # HubSpot ID is fetched on-demand when viewing a lead (not in the table)
+    Returns:
+        Human-readable activity type in German
+    """
+    act_type = activity.get('type', '')
 
-    # Create final flat table with renamed columns
-    result = pd.DataFrame({
-        'Lead Email': activities_clean['email'],
-        'Lead FirstName': activities_clean['firstName'].fillna(''),  # Replace NaN with empty string
-        'Lead LastName': activities_clean['lastName'].fillna(''),    # Replace NaN with empty string
-        'Activity Type': activities_clean['type_display'],  # Use display type with labels
-        'Activity Date': activities_clean['formatted_date'],
-        'Details': activities_clean['details'],
-        '_datetime_sort': activities_clean['datetime_obj']  # Keep for sorting
-    })
+    # For conditionChosen, use the label
+    if act_type == 'conditionChosen':
+        return activity.get('conditionLabel', 'Bedingung erfüllt')
 
-    # Sort by datetime object (oldest first = chronologisch wie Interaktion passierte)
-    result = result.sort_values('_datetime_sort', ascending=True)
+    # Use mapping, fallback to original type
+    return ACTIVITY_TYPE_MAP.get(act_type, act_type)
 
-    # Remove the sort helper column
-    result = result.drop(columns=['_datetime_sort'])
 
-    return result
+def get_activity_details(activity: Dict) -> str:
+    """Extract meaningful details from activity.
+
+    Args:
+        activity: Activity dict from Lemlist API
+
+    Returns:
+        Details string (subject, URL, message, or condition info)
+    """
+    act_type = activity.get('type', '')
+
+    if act_type == 'conditionChosen':
+        label = activity.get('conditionLabel', 'Unbekannt')
+        value = activity.get('conditionValue')
+        if value is not None:
+            result = 'Ja ✓' if value else 'Nein ✗'
+            return f"Bedingung: {label} → Erfüllt: {result}"
+        return f"Bedingung: {label}"
+
+    # Try different detail fields
+    if 'subject' in activity:
+        return str(activity['subject'])
+    elif 'url' in activity:
+        return str(activity['url'])
+    elif 'message' in activity:
+        return str(activity['message'])
+
+    return ''
+
+
+def process_activity_for_db(activity: Dict) -> Optional[Dict]:
+    """Process a single activity for database storage.
+
+    Args:
+        activity: Activity dict from Lemlist API
+
+    Returns:
+        Processed activity dict ready for DB, or None if invalid
+    """
+    # Skip activities without leadEmail
+    if not activity.get('leadEmail'):
+        return None
+
+    act_copy = activity.copy()
+    act_copy['type_display'] = get_activity_display_type(activity)
+    act_copy['details'] = get_activity_details(activity)
+
+    return act_copy
 
 
 @st.cache_data(ttl=3600)
@@ -399,7 +364,7 @@ def load_campaign_data_from_db(campaign_id: str) -> pd.DataFrame:
         try:
             dt = pd.to_datetime(date_str)
             return dt.strftime('%Y-%m-%d %H:%M')
-        except:
+        except Exception:
             return str(date_str)
 
     def format_hubspot_link(hubspot_id):
@@ -438,8 +403,20 @@ def load_campaign_data_from_db(campaign_id: str) -> pd.DataFrame:
     return df
 
 
-def sync_campaign_data(api_key: str, campaign_id: str, force_full_reload: bool = False) -> pd.DataFrame:
-    """Sync campaign data from API to database with incremental updates"""
+def sync_campaign_data(api_key: str, campaign_id: str, force_full_reload: bool = False,
+                       campaign_name: Optional[str] = None, campaign_status: Optional[str] = None) -> pd.DataFrame:
+    """Sync campaign data from API to database with incremental updates.
+
+    Args:
+        api_key: Lemlist API key
+        campaign_id: Campaign ID
+        force_full_reload: If True, reload all data from scratch
+        campaign_name: Optional campaign name (from dropdown)
+        campaign_status: Optional campaign status (from dropdown)
+
+    Returns:
+        DataFrame with campaign activities
+    """
     db = LemlistDB()
     client = LemlistClient(api_key)
 
@@ -457,26 +434,7 @@ def sync_campaign_data(api_key: str, campaign_id: str, force_full_reload: bool =
 
         # Extract unique leads from activities response
         with st.spinner("Extrahiere Lead-Daten aus Activities..."):
-            leads_dict = {}
-            for activity in activities:
-                email = activity.get('leadEmail') or activity.get('email')
-                if email and email not in leads_dict:
-                    # Extract all lead-related fields from activity
-                    leads_dict[email] = {
-                        'email': email,
-                        'firstName': activity.get('leadFirstName') or activity.get('firstName'),
-                        'lastName': activity.get('leadLastName') or activity.get('lastName'),
-                        'hubspotLeadId': activity.get('hubspotLeadId'),
-                        'linkedinUrl': (activity.get('linkedinUrl') or
-                                       activity.get('linkedinUrlSalesNav') or
-                                       activity.get('linkedinPublicUrl')),
-                        'companyName': activity.get('leadCompanyName') or activity.get('companyName'),
-                        'jobTitle': activity.get('jobTitle'),
-                        'phone': activity.get('leadPhone') or activity.get('phone'),
-                        'location': activity.get('location'),
-                    }
-
-            leads = list(leads_dict.values())
+            leads = extract_leads_from_activities(activities)
             st.success(f"✅ {len(leads)} eindeutige Leads extrahiert")
 
         # Fetch HubSpot IDs for leads (activities don't contain HubSpot IDs!)
@@ -503,7 +461,8 @@ def sync_campaign_data(api_key: str, campaign_id: str, force_full_reload: bool =
                     # Small delay to respect rate limits
                     time.sleep(0.15)
 
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"Failed to fetch HubSpot ID for {email}: {e}")
                     processed += 1
                     continue
 
@@ -511,67 +470,21 @@ def sync_campaign_data(api_key: str, campaign_id: str, force_full_reload: bool =
 
         # Save to DB
         with st.spinner("Speichere in Datenbank..."):
-            # Get campaign info from first lead
-            campaign_name = f"Campaign {campaign_id}"
-            if leads:
-                # Try to get campaign name from leads (if available in API response)
-                campaign_name = leads[0].get('campaignName', campaign_name)
+            # Use provided campaign name/status or fallback to generic values
+            name = campaign_name or f"Campaign {campaign_id}"
+            status = campaign_status or "unknown"
 
-            db.upsert_campaign(campaign_id, campaign_name, "unknown")
+            db.upsert_campaign(campaign_id, name, status)
             db.upsert_leads(leads, campaign_id)
 
             # Process activities for DB storage
-            activities_processed = []
-            for act in activities:
-                # Skip activities without leadEmail (can't link them to a lead)
-                if not act.get('leadEmail'):
-                    continue
-
-                # Add processed fields from merge_leads_activities logic
-                act_copy = act.copy()
-
-                # Get display type
-                act_type = act.get('type', '')
-                if act_type == 'conditionChosen':
-                    act_copy['type_display'] = act.get('conditionLabel', 'Bedingung erfüllt')
-                else:
-                    activity_map = {
-                        'emailsSent': 'Email gesendet',
-                        'emailsOpened': 'Email geöffnet',
-                        'emailsClicked': 'Email geklickt',
-                        'emailsReplied': 'Email beantwortet',
-                        'emailsBounced': 'Email bounced',
-                        'emailsFailed': 'Email fehlgeschlagen',
-                        'emailsUnsubscribed': 'Abgemeldet',
-                        'linkedinVisitDone': 'LinkedIn Besuch',
-                        'linkedinSent': 'LinkedIn Nachricht gesendet',
-                        'linkedinOpened': 'LinkedIn geöffnet',
-                        'linkedinReplied': 'LinkedIn beantwortet',
-                    }
-                    act_copy['type_display'] = activity_map.get(act_type, act_type)
-
-                # Extract details
-                if act_type == 'conditionChosen':
-                    label = act.get('conditionLabel', 'Unbekannt')
-                    value = act.get('conditionValue')
-                    if value is not None:
-                        result = 'Ja ✓' if value else 'Nein ✗'
-                        act_copy['details'] = f"Bedingung: {label} → Erfüllt: {result}"
-                    else:
-                        act_copy['details'] = f"Bedingung: {label}"
-                elif 'subject' in act:
-                    act_copy['details'] = str(act['subject'])
-                elif 'url' in act:
-                    act_copy['details'] = str(act['url'])
-                elif 'message' in act:
-                    act_copy['details'] = str(act['message'])
-                else:
-                    act_copy['details'] = ''
-
-                activities_processed.append(act_copy)
+            activities_processed = [
+                processed for act in activities
+                if (processed := process_activity_for_db(act)) is not None
+            ]
 
             db.upsert_activities(activities_processed, campaign_id)
-            st.success(f"✅ {len(activities)} Activities gespeichert")
+            st.success(f"✅ {len(activities_processed)} Activities gespeichert")
 
     else:
         st.info("🔄 Incremental Update - lade nur neue Activities...")
@@ -593,27 +506,10 @@ def sync_campaign_data(api_key: str, campaign_id: str, force_full_reload: bool =
                 new_activities = all_activities
 
             # Extract leads from new activities
-            leads_dict = {}
-            for activity in new_activities:
-                email = activity.get('leadEmail') or activity.get('email')
-                if email and email not in leads_dict:
-                    leads_dict[email] = {
-                        'email': email,
-                        'firstName': activity.get('leadFirstName') or activity.get('firstName'),
-                        'lastName': activity.get('leadLastName') or activity.get('lastName'),
-                        'hubspotLeadId': activity.get('hubspotLeadId'),
-                        'linkedinUrl': (activity.get('linkedinUrl') or
-                                       activity.get('linkedinUrlSalesNav') or
-                                       activity.get('linkedinPublicUrl')),
-                        'companyName': activity.get('leadCompanyName') or activity.get('companyName'),
-                        'jobTitle': activity.get('jobTitle'),
-                        'phone': activity.get('leadPhone') or activity.get('phone'),
-                        'location': activity.get('location'),
-                    }
+            new_leads = extract_leads_from_activities(new_activities)
 
             # Save new leads to DB
-            if leads_dict:
-                new_leads = list(leads_dict.values())
+            if new_leads:
 
                 # Fetch HubSpot IDs for new leads
                 with st.spinner(f"Lade HubSpot IDs für {len(new_leads)} neue Lead(s)..."):
@@ -636,7 +532,8 @@ def sync_campaign_data(api_key: str, campaign_id: str, force_full_reload: bool =
                             processed += 1
                             time.sleep(0.15)
 
-                        except Exception:
+                        except Exception as e:
+                            logger.warning(f"Failed to fetch HubSpot ID for {email}: {e}")
                             processed += 1
                             continue
 
@@ -650,55 +547,13 @@ def sync_campaign_data(api_key: str, campaign_id: str, force_full_reload: bool =
                 st.success(f"✅ {len(new_activities)} neue Activities gefunden")
 
                 # Process and save new activities
-                activities_processed = []
-                for act in new_activities:
-                    # Skip activities without leadEmail (can't link them to a lead)
-                    if not act.get('leadEmail'):
-                        continue
-
-                    act_copy = act.copy()
-
-                    # Same processing as above
-                    act_type = act.get('type', '')
-                    if act_type == 'conditionChosen':
-                        act_copy['type_display'] = act.get('conditionLabel', 'Bedingung erfüllt')
-                    else:
-                        activity_map = {
-                            'emailsSent': 'Email gesendet',
-                            'emailsOpened': 'Email geöffnet',
-                            'emailsClicked': 'Email geklickt',
-                            'emailsReplied': 'Email beantwortet',
-                            'emailsBounced': 'Email bounced',
-                            'emailsFailed': 'Email fehlgeschlagen',
-                            'emailsUnsubscribed': 'Abgemeldet',
-                            'linkedinVisitDone': 'LinkedIn Besuch',
-                            'linkedinSent': 'LinkedIn Nachricht gesendet',
-                            'linkedinOpened': 'LinkedIn geöffnet',
-                            'linkedinReplied': 'LinkedIn beantwortet',
-                        }
-                        act_copy['type_display'] = activity_map.get(act_type, act_type)
-
-                    if act_type == 'conditionChosen':
-                        label = act.get('conditionLabel', 'Unbekannt')
-                        value = act.get('conditionValue')
-                        if value is not None:
-                            result = 'Ja ✓' if value else 'Nein ✗'
-                            act_copy['details'] = f"Bedingung: {label} → Erfüllt: {result}"
-                        else:
-                            act_copy['details'] = f"Bedingung: {label}"
-                    elif 'subject' in act:
-                        act_copy['details'] = str(act['subject'])
-                    elif 'url' in act:
-                        act_copy['details'] = str(act['url'])
-                    elif 'message' in act:
-                        act_copy['details'] = str(act['message'])
-                    else:
-                        act_copy['details'] = ''
-
-                    activities_processed.append(act_copy)
+                activities_processed = [
+                    processed for act in new_activities
+                    if (processed := process_activity_for_db(act)) is not None
+                ]
 
                 db.upsert_activities(activities_processed, campaign_id)
-                st.success(f"✅ {len(new_activities)} neue Activities gespeichert")
+                st.success(f"✅ {len(activities_processed)} neue Activities gespeichert")
             else:
                 st.info("ℹ️ Keine neuen Activities gefunden")
 
@@ -754,7 +609,8 @@ def fetch_lead_details_batch(api_key: str, campaign_id: str, batch_size: int = 1
             # Small delay to respect rate limits
             time.sleep(0.15)
 
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Failed to fetch details for {email}: {e}")
             processed += 1
             failed += 1
 
@@ -806,6 +662,8 @@ def main():
 
         # Campaign Selection
         campaign_id = None
+        selected_campaign_name = None
+        selected_campaign_status = None
         use_dropdown = st.checkbox(
             "📋 Campaign aus Liste wählen",
             value=True,
@@ -834,28 +692,36 @@ def main():
                 else:
                     st.success(f"✅ {len(campaigns)} Campaigns geladen")
 
-                    # Create dropdown options
-                    campaign_options = {
-                        f"{c.get('name', 'Unnamed')} ({c.get('status', 'unknown')})": c.get('_id')
+                    # Create dropdown options with full campaign info
+                    campaign_info = {
+                        f"{c.get('name', 'Unnamed')} ({c.get('status', 'unknown')})": {
+                            'id': c.get('_id'),
+                            'name': c.get('name', 'Unnamed'),
+                            'status': c.get('status', 'unknown')
+                        }
                         for c in campaigns
                     }
 
                     # Find default selection from .env if present
                     default_index = 0
                     if default_campaign_id:
-                        for idx, cid in enumerate(campaign_options.values()):
-                            if cid == default_campaign_id:
+                        for idx, info in enumerate(campaign_info.values()):
+                            if info['id'] == default_campaign_id:
                                 default_index = idx
                                 break
 
                     selected_campaign = st.selectbox(
                         "Campaign auswählen",
-                        options=list(campaign_options.keys()),
+                        options=list(campaign_info.keys()),
                         index=default_index,
                         help="Wähle eine Campaign aus der Liste"
                     )
 
-                    campaign_id = campaign_options[selected_campaign]
+                    # Extract campaign info
+                    selected_info = campaign_info[selected_campaign]
+                    campaign_id = selected_info['id']
+                    selected_campaign_name = selected_info['name']
+                    selected_campaign_status = selected_info['status']
 
             except UnauthorizedError:
                 st.error("❌ Ungültiger API Key")
@@ -956,7 +822,13 @@ def main():
 
         try:
             # Sync data from API to DB
-            df = sync_campaign_data(api_key, campaign_id, force_full_reload=force_reload)
+            df = sync_campaign_data(
+                api_key,
+                campaign_id,
+                force_full_reload=force_reload,
+                campaign_name=selected_campaign_name,
+                campaign_status=selected_campaign_status
+            )
 
             # Store in session state
             st.session_state.df = df
@@ -993,8 +865,9 @@ def main():
             if len(df) > 0:
                 st.session_state.df = df
                 st.session_state.current_campaign_id = campaign_id
-        except Exception:
-            pass  # Silently fail if no data in DB yet
+        except Exception as e:
+            # Expected when no data in DB yet, log at debug level
+            logger.debug(f"No cached data for campaign {campaign_id}: {e}")
 
     # Display data if available in session state
     if st.session_state.df is not None:

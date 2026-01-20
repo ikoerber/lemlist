@@ -177,23 +177,23 @@ class LemlistDB:
 
     def update_lead_details(self, email: str, hubspot_id: Optional[str] = None,
                            linkedin_url: Optional[str] = None):
-        """Update HubSpot ID and/or LinkedIn URL for a lead"""
+        """Update HubSpot ID and/or LinkedIn URL for a lead.
+
+        Uses a single UPDATE statement with COALESCE to only update
+        non-NULL values while preserving existing data.
+        """
+        if hubspot_id is None and linkedin_url is None:
+            return  # Nothing to update
+
         with self.get_connection() as conn:
             cursor = conn.cursor()
-
-            if hubspot_id is not None:
-                cursor.execute("""
-                    UPDATE leads
-                    SET hubspot_id = ?, last_updated = ?
-                    WHERE email = ?
-                """, (hubspot_id, datetime.now(), email))
-
-            if linkedin_url is not None:
-                cursor.execute("""
-                    UPDATE leads
-                    SET linkedin_url = ?, last_updated = ?
-                    WHERE email = ?
-                """, (linkedin_url, datetime.now(), email))
+            cursor.execute("""
+                UPDATE leads
+                SET hubspot_id = COALESCE(?, hubspot_id),
+                    linkedin_url = COALESCE(?, linkedin_url),
+                    last_updated = ?
+                WHERE email = ?
+            """, (hubspot_id, linkedin_url, datetime.now(), email))
 
     def get_lead(self, email: str) -> Optional[Dict]:
         """Get lead by email"""
@@ -347,6 +347,13 @@ class LemlistDB:
             cursor.execute("DELETE FROM campaigns WHERE campaign_id = ?", (campaign_id,))
 
     def vacuum(self):
-        """Optimize database"""
-        with self.get_connection() as conn:
+        """Optimize database.
+
+        Note: VACUUM cannot run inside a transaction, so we use
+        isolation_level=None for autocommit mode.
+        """
+        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        try:
             conn.execute("VACUUM")
+        finally:
+            conn.close()
