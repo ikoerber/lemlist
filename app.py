@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import requests
+import re
 from datetime import datetime
 import time
 import os
@@ -45,36 +46,52 @@ HUBSPOT_BATCH_DELAY = 0.25  # Seconds between batch API calls (4 req/sec limit)
 
 # Job Level Keywords for classification (matching HubSpot property values)
 # Order matters: check from most senior to least senior
+# Uses word-boundary matching to avoid false positives (e.g., 'cto' in 'director')
 JOB_LEVEL_KEYWORDS = {
     'owner': [
-        # C-Level (DE + EN)
-        'ceo', 'cto', 'cfo', 'cmo', 'coo', 'cio', 'cpo', 'cro',
-        'chief', 'president', 'owner', 'founder', 'co-founder',
-        'partner', 'inhaber', 'geschäftsführer', 'vorstand',
-        'managing director', 'general manager', 'gf', 'gm',
+        # C-Level (DE + EN) - exact abbreviations need word boundaries
+        r'\bceo\b', r'\bcto\b', r'\bcfo\b', r'\bcmo\b', r'\bcoo\b', r'\bcio\b', r'\bcpo\b', r'\bcro\b',
+        r'\bchief\b', r'\bpresident\b', r'\bowner\b', r'\bfounder\b', r'\bco-founder\b',
+        r'\bpartner\b', r'\binhaber\b', r'\bgeschäftsführer\b', r'\bvorstand\b',
+        r'\bmanaging director\b', r'\bgeneral manager\b',
+        # German abbreviations - be careful with these
+        r'\bgf\b', r'\bgm\b',
     ],
     'director': [
         # Director/VP level (DE + EN)
-        'director', 'vp', 'vice president', 'svp', 'evp',
-        'head of', 'leiter', 'bereichsleiter', 'abteilungsleiter',
-        'direktor', 'principal',
+        r'\bdirector\b', r'\bdirektor\b', r'\bvp\b', r'\bvice president\b', r'\bsvp\b', r'\bevp\b',
+        r'\bhead of\b',
+        # German: High-level "leiter" roles (Bereichs-, Abteilungs-, Vertriebs-)
+        r'\bbereichsleiter', r'\babteilungsleiter', r'\bvertriebsleiter',
+        r'\bleiter\b', r'\bleiterin\b', r'\bleitung\b',  # Standalone "Leiter"
     ],
     'manager': [
         # Manager level (DE + EN)
-        'manager', 'lead', 'team lead', 'teamleiter', 'teamlead',
-        'supervisor', 'coordinator', 'gruppenleiter',
+        # Match "manager" at end of word for German compounds (Marketingmanager, Produktmanager)
+        r'manager\b', r'managerin\b',
+        # Team/Project leads are manager level, not director
+        r'\bteam\s*lead', r'\bteamleiter', r'\bteamlead', r'\bteamleiterin\b',
+        r'\bprojektleiter', r'\bgruppenleiter',
+        r'\blead\b',  # "Lead" alone (e.g., "Marketing Lead")
+        r'\bsupervisor\b', r'\bcoordinator\b',
     ],
     'senior': [
         # Senior individual contributor
-        'senior', 'sr.', 'sr ', 'expert', 'specialist',
-        'principal', 'staff',
+        r'\bsenior\b', r'\bsr\.\b', r'\bsr\s', r'\bexpert\b', r'\bspecialist\b',
+        r'\bprincipal\b', r'\bstaff\b',
     ],
     # 'employee' is the default, no keywords needed
 }
 
+# Pre-compile regex patterns for performance
+_JOB_LEVEL_PATTERNS = {
+    level: [re.compile(pattern, re.IGNORECASE) for pattern in patterns]
+    for level, patterns in JOB_LEVEL_KEYWORDS.items()
+}
+
 
 def calculate_job_level(job_title: Optional[str]) -> str:
-    """Calculate job level from job title using keyword matching.
+    """Calculate job level from job title using word-boundary regex matching.
 
     Maps job titles to HubSpot-compatible levels:
     - owner: C-Level (CEO, CTO, etc.)
@@ -92,12 +109,10 @@ def calculate_job_level(job_title: Optional[str]) -> str:
     if not job_title:
         return 'employee'
 
-    title_lower = job_title.lower()
-
-    # Check each level in order of seniority
-    for level, keywords in JOB_LEVEL_KEYWORDS.items():
-        for keyword in keywords:
-            if keyword in title_lower:
+    # Check each level in order of seniority (owner > director > manager > senior)
+    for level, patterns in _JOB_LEVEL_PATTERNS.items():
+        for pattern in patterns:
+            if pattern.search(job_title):
                 return level
 
     return 'employee'
