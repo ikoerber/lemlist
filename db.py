@@ -97,6 +97,7 @@ class LemlistDB:
                     company_name TEXT,
                     department TEXT,
                     job_title TEXT,
+                    job_level TEXT,
                     hubspot_id TEXT,
                     linkedin_url TEXT,
                     last_updated TIMESTAMP,
@@ -116,6 +117,10 @@ class LemlistDB:
                 pass  # Column already exists
             try:
                 cursor.execute("ALTER TABLE leads ADD COLUMN job_title TEXT")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            try:
+                cursor.execute("ALTER TABLE leads ADD COLUMN job_level TEXT")
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
@@ -230,13 +235,15 @@ class LemlistDB:
                 job_title = (lead.get('jobTitle') or
                             lead.get('job_title') or
                             lead.get('position'))
+                job_level = lead.get('job_level')
 
                 cursor.execute("""
                     INSERT INTO leads (
                         lead_id, email, campaign_id, first_name, last_name,
-                        company_name, department, job_title, hubspot_id, linkedin_url, last_updated
+                        company_name, department, job_title, job_level,
+                        hubspot_id, linkedin_url, last_updated
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(lead_id) DO UPDATE SET
                         email = excluded.email,
                         first_name = excluded.first_name,
@@ -244,6 +251,7 @@ class LemlistDB:
                         company_name = COALESCE(excluded.company_name, leads.company_name),
                         department = COALESCE(excluded.department, leads.department),
                         job_title = COALESCE(excluded.job_title, leads.job_title),
+                        job_level = COALESCE(excluded.job_level, leads.job_level),
                         hubspot_id = COALESCE(excluded.hubspot_id, leads.hubspot_id),
                         linkedin_url = COALESCE(excluded.linkedin_url, leads.linkedin_url),
                         last_updated = excluded.last_updated
@@ -256,6 +264,7 @@ class LemlistDB:
                     company_name,
                     department,
                     job_title,
+                    job_level,
                     hubspot_id,
                     linkedin_url,
                     now
@@ -265,7 +274,8 @@ class LemlistDB:
                            linkedin_url: Optional[str] = None,
                            company_name: Optional[str] = None,
                            department: Optional[str] = None,
-                           job_title: Optional[str] = None):
+                           job_title: Optional[str] = None,
+                           job_level: Optional[str] = None):
         """Update lead details from /leads/{email} API response.
 
         Args:
@@ -275,11 +285,12 @@ class LemlistDB:
             company_name: Optional company name
             department: Optional department
             job_title: Optional job title
+            job_level: Optional job level (owner, director, manager, senior, employee)
 
         Uses a single UPDATE statement with COALESCE to only update
         non-NULL values while preserving existing data.
         """
-        if all(v is None for v in [hubspot_id, linkedin_url, company_name, department, job_title]):
+        if all(v is None for v in [hubspot_id, linkedin_url, company_name, department, job_title, job_level]):
             return  # Nothing to update
 
         with self.get_connection() as conn:
@@ -291,9 +302,10 @@ class LemlistDB:
                     company_name = COALESCE(?, company_name),
                     department = COALESCE(?, department),
                     job_title = COALESCE(?, job_title),
+                    job_level = COALESCE(?, job_level),
                     last_updated = ?
                 WHERE lead_id = ?
-            """, (hubspot_id, linkedin_url, company_name, department, job_title, datetime.now(), lead_id))
+            """, (hubspot_id, linkedin_url, company_name, department, job_title, job_level, datetime.now(), lead_id))
 
     def get_lead(self, lead_id: str) -> Optional[Dict]:
         """Get lead by lead_id"""
@@ -396,6 +408,7 @@ class LemlistDB:
                     l.company_name as lead_company_name,
                     l.department as lead_department,
                     l.job_title as lead_job_title,
+                    l.job_level as lead_job_level,
                     l.hubspot_id as lead_hubspot_id,
                     l.linkedin_url as lead_linkedin_url
                 FROM activities a

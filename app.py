@@ -43,6 +43,65 @@ LEAD_BATCH_PAUSE = 2.0  # Seconds to pause between batches
 HUBSPOT_BATCH_SIZE = 50  # Contacts per batch for HubSpot sync
 HUBSPOT_BATCH_DELAY = 0.25  # Seconds between batch API calls (4 req/sec limit)
 
+# Job Level Keywords for classification (matching HubSpot property values)
+# Order matters: check from most senior to least senior
+JOB_LEVEL_KEYWORDS = {
+    'owner': [
+        # C-Level (DE + EN)
+        'ceo', 'cto', 'cfo', 'cmo', 'coo', 'cio', 'cpo', 'cro',
+        'chief', 'president', 'owner', 'founder', 'co-founder',
+        'partner', 'inhaber', 'geschäftsführer', 'vorstand',
+        'managing director', 'general manager', 'gf', 'gm',
+    ],
+    'director': [
+        # Director/VP level (DE + EN)
+        'director', 'vp', 'vice president', 'svp', 'evp',
+        'head of', 'leiter', 'bereichsleiter', 'abteilungsleiter',
+        'direktor', 'principal',
+    ],
+    'manager': [
+        # Manager level (DE + EN)
+        'manager', 'lead', 'team lead', 'teamleiter', 'teamlead',
+        'supervisor', 'coordinator', 'gruppenleiter',
+    ],
+    'senior': [
+        # Senior individual contributor
+        'senior', 'sr.', 'sr ', 'expert', 'specialist',
+        'principal', 'staff',
+    ],
+    # 'employee' is the default, no keywords needed
+}
+
+
+def calculate_job_level(job_title: Optional[str]) -> str:
+    """Calculate job level from job title using keyword matching.
+
+    Maps job titles to HubSpot-compatible levels:
+    - owner: C-Level (CEO, CTO, etc.)
+    - director: Director/VP/SVP
+    - manager: Manager/Team Lead
+    - senior: Senior roles
+    - employee: Default for all other roles
+
+    Args:
+        job_title: The job title to classify
+
+    Returns:
+        Job level string (owner, director, manager, senior, employee)
+    """
+    if not job_title:
+        return 'employee'
+
+    title_lower = job_title.lower()
+
+    # Check each level in order of seniority
+    for level, keywords in JOB_LEVEL_KEYWORDS.items():
+        for keyword in keywords:
+            if keyword in title_lower:
+                return level
+
+    return 'employee'
+
 
 def deduplicate_activities(activities: List[Dict]) -> List[Dict]:
     """Remove duplicate activities based on type-specific deduplication rules.
@@ -329,6 +388,7 @@ def extract_leads_from_activities(activities: List[Dict]) -> List[Dict]:
 
         # leadId is required for the new schema
         if lead_id and lead_id not in leads_dict:
+            job_title = activity.get('jobTitle')
             leads_dict[lead_id] = {
                 'leadId': lead_id,
                 'email': email,
@@ -339,7 +399,8 @@ def extract_leads_from_activities(activities: List[Dict]) -> List[Dict]:
                                activity.get('linkedinUrlSalesNav') or
                                activity.get('linkedinPublicUrl')),
                 'companyName': activity.get('leadCompanyName') or activity.get('companyName'),
-                'jobTitle': activity.get('jobTitle'),
+                'jobTitle': job_title,
+                'job_level': calculate_job_level(job_title),
                 'phone': activity.get('leadPhone') or activity.get('phone'),
                 'location': activity.get('location'),
             }
@@ -433,7 +494,7 @@ def load_campaign_data_from_db(campaign_id: str) -> pd.DataFrame:
     if not activities_db:
         return pd.DataFrame(columns=[
             'Lead Email', 'Lead FirstName', 'Lead LastName',
-            'Company', 'Department', 'Job Title',
+            'Company', 'Department', 'Job Title', 'Job Level',
             'Activity Type', 'Activity Date', 'Details',
             'HubSpot Link', 'LinkedIn Link'
         ])
@@ -469,6 +530,7 @@ def load_campaign_data_from_db(campaign_id: str) -> pd.DataFrame:
             'Company': activity.get('lead_company_name') or '',
             'Department': activity.get('lead_department') or '',
             'Job Title': activity.get('lead_job_title') or '',
+            'Job Level': activity.get('lead_job_level') or '',
             'Activity Type': activity['type_display'] or activity['type'],
             'Activity Date': format_date(activity['created_at']),
             'Details': activity['details'] or '',
@@ -707,6 +769,9 @@ def fetch_all_lead_details(api_key: str, campaign_id: str,
                         lead_details.get('position') or
                         None)
 
+            # Calculate job level from job title
+            job_level = calculate_job_level(job_title) if job_title else None
+
             # Update DB using lead_id as identifier
             db.update_lead_details(
                 lead_id,
@@ -714,7 +779,8 @@ def fetch_all_lead_details(api_key: str, campaign_id: str,
                 linkedin_url=linkedin_url,
                 company_name=company_name,
                 department=department,
-                job_title=job_title
+                job_title=job_title,
+                job_level=job_level
             )
 
             if hubspot_id or linkedin_url or company_name or department or job_title:
