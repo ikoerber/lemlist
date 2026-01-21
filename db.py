@@ -168,6 +168,28 @@ class LemlistDB:
                 ON leads(email)
             """)
 
+            # ICP Scores table for industry fit scoring
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS icp_scores (
+                    hubspot_code TEXT PRIMARY KEY,
+                    branche TEXT NOT NULL,
+                    icp_score INTEGER NOT NULL,
+                    kategorie TEXT,
+                    referenzen TEXT,
+                    begruendung TEXT,
+                    last_updated TIMESTAMP
+                )
+            """)
+
+            # Job Level Scores table for job level fit scoring
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS joblevel_scores (
+                    job_level TEXT PRIMARY KEY,
+                    score INTEGER NOT NULL,
+                    last_updated TIMESTAMP
+                )
+            """)
+
     # Campaign Operations
 
     def upsert_campaign(self, campaign_id: str, name: str, status: str):
@@ -683,3 +705,260 @@ class LemlistDB:
             'lemlist_lead_status': lead_status,
             'lemlist_last_sync_date': format_date_as_timestamp(datetime.now(timezone.utc)),  # HubSpot date fields require midnight UTC
         }
+
+    # =========================================================================
+    # ICP Score Operations
+    # =========================================================================
+
+    def import_icp_scores_from_csv(self, csv_path: str) -> int:
+        """Import ICP scores from CSV file into database.
+
+        CSV must have columns: Branche, HubSpot_Code, ICP_Score, Kategorie, Referenzen, Begründung
+
+        Args:
+            csv_path: Path to CSV file
+
+        Returns:
+            Number of records imported
+        """
+        import pandas as pd
+
+        df = pd.read_csv(csv_path)
+        count = 0
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+
+            for _, row in df.iterrows():
+                hubspot_code = row.get('HubSpot_Code')
+                branche = row.get('Branche')
+                icp_score = row.get('ICP_Score')
+
+                if not hubspot_code or pd.isna(hubspot_code) or pd.isna(icp_score):
+                    continue
+
+                cursor.execute("""
+                    INSERT INTO icp_scores (hubspot_code, branche, icp_score, kategorie, referenzen, begruendung, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(hubspot_code) DO UPDATE SET
+                        branche = excluded.branche,
+                        icp_score = excluded.icp_score,
+                        kategorie = excluded.kategorie,
+                        referenzen = excluded.referenzen,
+                        begruendung = excluded.begruendung,
+                        last_updated = excluded.last_updated
+                """, (
+                    str(hubspot_code).strip(),
+                    str(branche).strip() if branche and pd.notna(branche) else hubspot_code,
+                    int(icp_score),
+                    str(row.get('Kategorie', '')).strip() if pd.notna(row.get('Kategorie')) else None,
+                    str(row.get('Referenzen', '')).strip() if pd.notna(row.get('Referenzen')) else None,
+                    str(row.get('Begründung', '')).strip() if pd.notna(row.get('Begründung')) else None,
+                    datetime.now()
+                ))
+                count += 1
+
+        return count
+
+    def get_all_icp_scores(self) -> List[Dict]:
+        """Get all ICP scores for UI display.
+
+        Returns:
+            List of dicts with all ICP score records
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT hubspot_code, branche, icp_score, kategorie, referenzen, begruendung, last_updated
+                FROM icp_scores
+                ORDER BY icp_score DESC, branche ASC
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_icp_score_lookup(self) -> Dict[str, int]:
+        """Get ICP scores as lookup dictionary.
+
+        Returns:
+            Dict mapping hubspot_code to icp_score: {'MACHINERY': 10, 'PLASTICS': 10, ...}
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT hubspot_code, icp_score FROM icp_scores")
+            return {row['hubspot_code']: row['icp_score'] for row in cursor.fetchall()}
+
+    def get_icp_score_count(self) -> int:
+        """Get count of ICP scores in database.
+
+        Returns:
+            Number of ICP score records
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) as count FROM icp_scores")
+            result = cursor.fetchone()
+            return result['count'] if result else 0
+
+    def update_icp_score(self, hubspot_code: str, icp_score: int) -> bool:
+        """Update a single ICP score.
+
+        Args:
+            hubspot_code: HubSpot industry code
+            icp_score: New score (0-10)
+
+        Returns:
+            True if updated successfully
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE icp_scores
+                SET icp_score = ?, last_updated = ?
+                WHERE hubspot_code = ?
+            """, (icp_score, datetime.now(), hubspot_code))
+            return cursor.rowcount > 0
+
+    def bulk_update_icp_scores(self, updates: List[Dict]) -> int:
+        """Bulk update ICP scores from data editor changes.
+
+        Args:
+            updates: List of dicts with hubspot_code and icp_score
+
+        Returns:
+            Number of records updated
+        """
+        count = 0
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            for update in updates:
+                cursor.execute("""
+                    UPDATE icp_scores
+                    SET icp_score = ?, last_updated = ?
+                    WHERE hubspot_code = ?
+                """, (update['icp_score'], datetime.now(), update['hubspot_code']))
+                if cursor.rowcount > 0:
+                    count += 1
+        return count
+
+    # =========================================================================
+    # Job Level Score Operations
+    # =========================================================================
+
+    def import_joblevel_scores_from_csv(self, csv_path: str) -> int:
+        """Import Job Level scores from CSV file into database.
+
+        CSV format: job_level,score (no header)
+
+        Args:
+            csv_path: Path to CSV file
+
+        Returns:
+            Number of records imported
+        """
+        import pandas as pd
+
+        df = pd.read_csv(csv_path, header=None, names=['job_level', 'score'])
+        count = 0
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+
+            for _, row in df.iterrows():
+                job_level = row.get('job_level')
+                score = row.get('score')
+
+                if not job_level or pd.isna(job_level) or pd.isna(score):
+                    continue
+
+                cursor.execute("""
+                    INSERT INTO joblevel_scores (job_level, score, last_updated)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(job_level) DO UPDATE SET
+                        score = excluded.score,
+                        last_updated = excluded.last_updated
+                """, (
+                    str(job_level).strip(),
+                    int(score),
+                    datetime.now()
+                ))
+                count += 1
+
+        return count
+
+    def get_all_joblevel_scores(self) -> List[Dict]:
+        """Get all Job Level scores for UI display.
+
+        Returns:
+            List of dicts with all job level score records
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT job_level, score, last_updated
+                FROM joblevel_scores
+                ORDER BY score DESC
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_joblevel_score_lookup(self) -> Dict[str, int]:
+        """Get Job Level scores as lookup dictionary.
+
+        Returns:
+            Dict mapping job_level to score: {'owner': 10, 'director': 8, ...}
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT job_level, score FROM joblevel_scores")
+            return {row['job_level']: row['score'] for row in cursor.fetchall()}
+
+    def get_joblevel_score_count(self) -> int:
+        """Get count of Job Level scores in database.
+
+        Returns:
+            Number of job level score records
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) as count FROM joblevel_scores")
+            result = cursor.fetchone()
+            return result['count'] if result else 0
+
+    def update_joblevel_score(self, job_level: str, score: int) -> bool:
+        """Update a single Job Level score.
+
+        Args:
+            job_level: Job level (owner, director, manager, senior, employee)
+            score: New score (0-10)
+
+        Returns:
+            True if updated successfully
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE joblevel_scores
+                SET score = ?, last_updated = ?
+                WHERE job_level = ?
+            """, (score, datetime.now(), job_level))
+            return cursor.rowcount > 0
+
+    def bulk_update_joblevel_scores(self, updates: List[Dict]) -> int:
+        """Bulk update Job Level scores from data editor changes.
+
+        Args:
+            updates: List of dicts with job_level and score
+
+        Returns:
+            Number of records updated
+        """
+        count = 0
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            for update in updates:
+                cursor.execute("""
+                    UPDATE joblevel_scores
+                    SET score = ?, last_updated = ?
+                    WHERE job_level = ?
+                """, (update['score'], datetime.now(), update['job_level']))
+                if cursor.rowcount > 0:
+                    count += 1
+        return count

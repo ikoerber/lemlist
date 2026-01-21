@@ -44,6 +44,16 @@ LEAD_BATCH_PAUSE = 2.0  # Seconds to pause between batches
 HUBSPOT_BATCH_SIZE = 50  # Contacts per batch for HubSpot sync
 HUBSPOT_BATCH_DELAY = 0.25  # Seconds between batch API calls (4 req/sec limit)
 
+# Mapping internal job levels to HubSpot hs_seniority property values
+# HubSpot accepts: owner, senior, manager, director, employee (all lowercase)
+JOB_LEVEL_TO_HUBSPOT_SENIORITY = {
+    'owner': 'owner',
+    'director': 'director',
+    'manager': 'manager',
+    'senior': 'senior',
+    'employee': 'employee',
+}
+
 # Job Level Keywords for classification (matching HubSpot property values)
 # Order matters: check from most senior to least senior
 # Uses word-boundary matching to avoid false positives (e.g., 'cto' in 'director')
@@ -60,7 +70,7 @@ JOB_LEVEL_KEYWORDS = {
     'director': [
         # Director/VP level (DE + EN)
         r'\bdirector\b', r'\bdirektor\b', r'\bvp\b', r'\bvice president\b', r'\bsvp\b', r'\bevp\b',
-        r'\bhead of\b',
+        r'\bhead\b',  # "Head of Marketing", "Head Product", "Head Digital", etc.
         # German: High-level "leiter" roles (Bereichs-, Abteilungs-, Vertriebs-)
         r'\bbereichsleiter', r'\babteilungsleiter', r'\bvertriebsleiter',
         r'\bleiter\b', r'\bleiterin\b', r'\bleitung\b',  # Standalone "Leiter"
@@ -925,6 +935,308 @@ def sync_to_hubspot(campaign_id: str, hubspot_token: str,
     }
 
 
+def sync_job_levels_to_hubspot(hubspot_token: str,
+                                batch_size: Optional[int] = None,
+                                progress_callback=None) -> Dict[str, int]:
+    """Sync job levels to ALL HubSpot contacts based on their job title.
+
+    Reads all HubSpot contacts with jobtitle, calculates job_level using
+    calculate_job_level(), and updates the hs_seniority property.
+
+    Only updates contacts that have a jobtitle but no hs_seniority set.
+
+    Args:
+        hubspot_token: HubSpot Private App access token
+        batch_size: Number of contacts per batch (max 100, default HUBSPOT_BATCH_SIZE)
+        progress_callback: Optional callback function(current, total) for progress updates
+
+    Returns:
+        Dict with statistics: {'total': int, 'updated': int, 'skipped': int, 'failed': int}
+    """
+    if batch_size is None:
+        batch_size = HUBSPOT_BATCH_SIZE
+
+    hubspot = HubSpotClient(hubspot_token)
+
+    # Fetch all contacts with jobtitle and hs_seniority
+    logger.info("Fetching all HubSpot contacts with jobtitle and hs_seniority...")
+    all_contacts = hubspot.get_all_contacts(['jobtitle', 'hs_seniority'])
+
+    total = len(all_contacts)
+    updated = 0
+    skipped = 0
+    failed = 0
+
+    # Filter contacts: have jobtitle but no hs_seniority
+    contacts_to_update = []
+    for contact in all_contacts:
+        props = contact.get('properties', {})
+        jobtitle = props.get('jobtitle')
+        hs_seniority = props.get('hs_seniority')
+
+        if jobtitle and not hs_seniority:
+            # Calculate job level
+            job_level = calculate_job_level(jobtitle)
+            hubspot_seniority = JOB_LEVEL_TO_HUBSPOT_SENIORITY.get(job_level, 'employee')
+
+            contacts_to_update.append({
+                'id': contact['id'],
+                'properties': {'hs_seniority': hubspot_seniority}
+            })
+        else:
+            skipped += 1
+
+    logger.info(f"Found {len(contacts_to_update)} contacts to update, {skipped} skipped")
+
+    # Process in batches
+    for i in range(0, len(contacts_to_update), batch_size):
+        batch = contacts_to_update[i:i + batch_size]
+
+        try:
+            hubspot.batch_update_contacts(batch)
+            updated += len(batch)
+        except HubSpotNotFoundError as e:
+            # Some contacts might not exist, try individual updates
+            logger.warning(f"Batch update had issues, trying individual: {e}")
+            for update in batch:
+                try:
+                    hubspot.update_contact_properties(
+                        update['id'],
+                        update['properties']
+                    )
+                    updated += 1
+                except HubSpotNotFoundError:
+                    logger.warning(f"Contact {update['id']} not found")
+                    failed += 1
+                except HubSpotError as e:
+                    logger.error(f"Failed to update contact {update['id']}: {e}")
+                    failed += 1
+        except HubSpotError as e:
+            logger.error(f"Batch {i // batch_size + 1} failed: {e}")
+            failed += len(batch)
+
+        # Update progress
+        if progress_callback:
+            progress_callback(i + len(batch), len(contacts_to_update))
+
+        # Rate limit: 4 req/sec for Batch API
+        time.sleep(HUBSPOT_BATCH_DELAY)
+
+    return {
+        'total': total,
+        'updated': updated,
+        'skipped': skipped,
+        'failed': failed
+    }
+
+
+def load_icp_scores() -> Dict[str, int]:
+    """Load ICP scores from database.
+
+    Returns:
+        Dict mapping HubSpot_Code to ICP_Score: {'MACHINERY': 10, 'PLASTICS': 10, ...}
+    """
+    db = LemlistDB()
+    return db.get_icp_score_lookup()
+
+
+def load_joblevel_scores() -> Dict[str, int]:
+    """Load Job Level scores from database.
+
+    Returns:
+        Dict mapping job_level to score: {'owner': 10, 'director': 8, ...}
+    """
+    db = LemlistDB()
+    return db.get_joblevel_score_lookup()
+
+
+def sync_fit_scores_to_hubspot(hubspot_token: str,
+                               overwrite_existing: bool = False,
+                               batch_size: Optional[int] = None,
+                               progress_callback=None) -> Dict[str, int]:
+    """Sync industry_fit and joblevel_fit scores to HubSpot contacts.
+
+    For each contact:
+    1. Gets the primary associated company → industry → industry_fit
+    2. Gets hs_seniority → joblevel_fit
+
+    Args:
+        hubspot_token: HubSpot Private App access token
+        overwrite_existing: If True, update all contacts. If False, only update contacts without values.
+        batch_size: Number of contacts per batch (max 100, default HUBSPOT_BATCH_SIZE)
+        progress_callback: Optional callback function(current, total, status_text) for progress updates
+
+    Returns:
+        Dict with statistics: {
+            'total': int,
+            'updated': int,
+            'skipped': int,
+            'no_company': int,
+            'no_industry': int,
+            'no_seniority': int,
+            'failed': int
+        }
+    """
+    if batch_size is None:
+        batch_size = HUBSPOT_BATCH_SIZE
+
+    hubspot = HubSpotClient(hubspot_token)
+
+    # Load ICP scores from DB
+    icp_lookup = load_icp_scores()
+    if not icp_lookup:
+        raise HubSpotError("Konnte ICP Scores nicht aus DB laden")
+
+    # Load Job Level scores from DB
+    joblevel_lookup = load_joblevel_scores()
+    if not joblevel_lookup:
+        raise HubSpotError("Konnte Job Level Scores nicht aus DB laden")
+
+    logger.info(f"Loaded {len(icp_lookup)} industry codes, {len(joblevel_lookup)} job levels from DB")
+
+    # Step 1: Fetch all contacts with company associations
+    if progress_callback:
+        progress_callback(0, 100, "Lade Kontakte mit Company-Verknüpfungen...")
+
+    all_contacts = hubspot.get_all_contacts_with_companies(['industry_fit', 'joblevel_fit', 'hs_seniority'])
+    total = len(all_contacts)
+
+    logger.info(f"Fetched {total} contacts with company associations")
+
+    # Step 2: Collect unique company IDs
+    company_ids = set()
+    contact_company_map = {}  # contact_id → primary_company_id
+
+    for contact in all_contacts:
+        contact_id = contact['id']
+        associations = contact.get('associations', {})
+        companies = associations.get('companies', {}).get('results', [])
+
+        if companies:
+            # Take first company as primary (HubSpot typically returns primary first)
+            primary_company_id = str(companies[0]['id'])
+            contact_company_map[contact_id] = primary_company_id
+            company_ids.add(primary_company_id)
+
+    logger.info(f"Found {len(company_ids)} unique companies to fetch")
+
+    # Step 3: Batch fetch company details
+    if progress_callback:
+        progress_callback(10, 100, f"Lade {len(company_ids)} Company-Details...")
+
+    company_data = hubspot.batch_get_companies(list(company_ids), ['industry', 'name'])
+
+    logger.info(f"Fetched {len(company_data)} company details")
+
+    # Step 4: Prepare updates
+    if progress_callback:
+        progress_callback(30, 100, "Berechne Fit Scores...")
+
+    contacts_to_update = []
+    skipped = 0
+    no_company = 0
+    no_industry = 0
+    no_seniority = 0
+
+    for contact in all_contacts:
+        contact_id = contact['id']
+        props = contact.get('properties', {})
+        current_industry_fit = props.get('industry_fit')
+        current_joblevel_fit = props.get('joblevel_fit')
+        hs_seniority = props.get('hs_seniority')
+
+        # Check if we need to update this contact
+        need_industry_update = overwrite_existing or not current_industry_fit
+        need_joblevel_update = overwrite_existing or not current_joblevel_fit
+
+        # Skip if nothing to update
+        if not need_industry_update and not need_joblevel_update:
+            skipped += 1
+            continue
+
+        properties_to_update = {}
+
+        # Calculate industry_fit
+        if need_industry_update:
+            company_id = contact_company_map.get(contact_id)
+            if not company_id:
+                no_company += 1
+                properties_to_update['industry_fit'] = 0
+            else:
+                company = company_data.get(company_id, {})
+                industry = company.get('properties', {}).get('industry')
+
+                if not industry:
+                    no_industry += 1
+                    properties_to_update['industry_fit'] = 0
+                else:
+                    icp_score = icp_lookup.get(industry, 0)
+                    properties_to_update['industry_fit'] = icp_score
+
+        # Calculate joblevel_fit
+        if need_joblevel_update:
+            if not hs_seniority:
+                no_seniority += 1
+                properties_to_update['joblevel_fit'] = 0
+            else:
+                joblevel_score = joblevel_lookup.get(hs_seniority, 0)
+                properties_to_update['joblevel_fit'] = joblevel_score
+
+        if properties_to_update:
+            contacts_to_update.append({
+                'id': contact_id,
+                'properties': properties_to_update
+            })
+
+    logger.info(f"Prepared {len(contacts_to_update)} contacts for update, {skipped} skipped, {no_company} no company, {no_industry} no industry, {no_seniority} no seniority")
+
+    # Step 5: Batch update contacts
+    updated = 0
+    failed = 0
+
+    for i in range(0, len(contacts_to_update), batch_size):
+        batch = contacts_to_update[i:i + batch_size]
+
+        if progress_callback:
+            progress = 30 + int(70 * (i / len(contacts_to_update)))
+            progress_callback(progress, 100, f"Update... {i}/{len(contacts_to_update)}")
+
+        try:
+            hubspot.batch_update_contacts(batch)
+            updated += len(batch)
+        except HubSpotNotFoundError as e:
+            logger.warning(f"Batch update had issues, trying individual: {e}")
+            for update in batch:
+                try:
+                    hubspot.update_contact_properties(
+                        update['id'],
+                        update['properties']
+                    )
+                    updated += 1
+                except HubSpotNotFoundError:
+                    logger.warning(f"Contact {update['id']} not found")
+                    failed += 1
+                except HubSpotError as e:
+                    logger.error(f"Failed to update contact {update['id']}: {e}")
+                    failed += 1
+        except HubSpotError as e:
+            logger.error(f"Batch {i // batch_size + 1} failed: {e}")
+            failed += len(batch)
+
+        # Rate limit: 4 req/sec for Batch API
+        time.sleep(HUBSPOT_BATCH_DELAY)
+
+    return {
+        'total': total,
+        'updated': updated,
+        'skipped': skipped,
+        'no_company': no_company,
+        'no_industry': no_industry,
+        'no_seniority': no_seniority,
+        'failed': failed
+    }
+
+
 # Streamlit UI
 def main():
     # Load environment variables from .env file
@@ -1158,6 +1470,218 @@ def main():
                     st.error(f"Rate Limit - warte {e.retry_after}s")
                 except HubSpotError as e:
                     st.error(f"Fehler: {str(e)}")
+
+            # Job Levels Sync Sub-Section
+            st.markdown("---")
+            st.markdown("**Job Levels Sync**")
+            st.caption("Setzt hs_seniority für alle HubSpot Kontakte basierend auf Job Title")
+
+            job_levels_disabled = not hubspot_token
+
+            if st.button("🎯 Job Levels syncen", use_container_width=True, disabled=job_levels_disabled,
+                        help="Liest alle HubSpot Kontakte und setzt hs_seniority basierend auf jobtitle"):
+                try:
+                    hubspot_client = HubSpotClient(hubspot_token)
+                    if not hubspot_client.verify_token():
+                        st.error("Ungültiger Token")
+                    else:
+                        progress_bar = st.progress(0, text="Lade alle HubSpot Kontakte...")
+
+                        def update_job_level_progress(current, total):
+                            progress = current / total if total > 0 else 0
+                            progress_bar.progress(progress, text=f"Update... {current}/{total}")
+
+                        result = sync_job_levels_to_hubspot(
+                            hubspot_token,
+                            batch_size=HUBSPOT_BATCH_SIZE,
+                            progress_callback=update_job_level_progress
+                        )
+                        progress_bar.empty()
+
+                        st.success(f"✅ {result['updated']} von {result['total']} Kontakten aktualisiert")
+                        st.caption(f"Übersprungen: {result['skipped']} (bereits gesetzt oder kein Job Title)")
+                        if result['failed'] > 0:
+                            st.warning(f"⚠️ {result['failed']} fehlgeschlagen")
+
+                except HubSpotUnauthorizedError:
+                    st.error("Ungültiger Token")
+                except HubSpotRateLimitError as e:
+                    st.error(f"Rate Limit - warte {e.retry_after}s")
+                except HubSpotError as e:
+                    st.error(f"Fehler: {str(e)}")
+
+            # Fit Scores Sync Sub-Section
+            st.markdown("---")
+            st.markdown("**Fit Scores Sync**")
+            st.caption("Setzt industry_fit und joblevel_fit basierend auf Company-Branche und Job Level")
+
+            fit_sync_disabled = not hubspot_token
+            overwrite_fit_scores = st.checkbox("Bestehende Werte überschreiben", value=False,
+                                               help="Wenn aktiviert, werden auch Kontakte mit bestehenden Fit-Werten aktualisiert")
+
+            if st.button("🎯 Fit Scores syncen", use_container_width=True, disabled=fit_sync_disabled,
+                        help="Setzt industry_fit und joblevel_fit für alle Kontakte"):
+                try:
+                    hubspot_client = HubSpotClient(hubspot_token)
+                    if not hubspot_client.verify_token():
+                        st.error("Ungültiger Token")
+                    else:
+                        progress_bar = st.progress(0, text="Starte...")
+
+                        def update_fit_progress(current, total, status_text):
+                            progress = current / total if total > 0 else 0
+                            progress_bar.progress(progress, text=status_text)
+
+                        result = sync_fit_scores_to_hubspot(
+                            hubspot_token,
+                            overwrite_existing=overwrite_fit_scores,
+                            batch_size=HUBSPOT_BATCH_SIZE,
+                            progress_callback=update_fit_progress
+                        )
+                        progress_bar.empty()
+
+                        st.success(f"✅ {result['updated']} von {result['total']} Kontakten aktualisiert")
+                        details = []
+                        if result['skipped'] > 0:
+                            details.append(f"Übersprungen: {result['skipped']}")
+                        if result['no_company'] > 0:
+                            details.append(f"Ohne Company: {result['no_company']}")
+                        if result['no_industry'] > 0:
+                            details.append(f"Ohne Branche: {result['no_industry']}")
+                        if result['no_seniority'] > 0:
+                            details.append(f"Ohne Seniority: {result['no_seniority']}")
+                        if details:
+                            st.caption(" | ".join(details))
+                        if result['failed'] > 0:
+                            st.warning(f"⚠️ {result['failed']} fehlgeschlagen")
+
+                except HubSpotUnauthorizedError:
+                    st.error("Ungültiger Token")
+                except HubSpotRateLimitError as e:
+                    st.error(f"Rate Limit - warte {e.retry_after}s")
+                except HubSpotError as e:
+                    st.error(f"Fehler: {str(e)}")
+
+            # ICP Branchen-Gewichtung Sub-Section
+            st.markdown("---")
+            st.markdown("**ICP Branchen-Gewichtung**")
+
+            icp_count = db.get_icp_score_count()
+            st.caption(f"{icp_count} Branchen in der Datenbank")
+
+            col_import, _ = st.columns([1, 2])
+            with col_import:
+                if st.button("📥 CSV importieren", use_container_width=True,
+                            help="Importiert ICP Scores aus Branchen_ICP_Gewichtung.csv"):
+                    try:
+                        imported = db.import_icp_scores_from_csv("Branchen_ICP_Gewichtung.csv")
+                        st.success(f"✅ {imported} Branchen importiert")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Import fehlgeschlagen: {e}")
+
+            if icp_count > 0:
+                icp_scores = db.get_all_icp_scores()
+                df_icp = pd.DataFrame(icp_scores)
+
+                # Rename columns for display
+                df_icp = df_icp.rename(columns={
+                    'hubspot_code': 'HubSpot Code',
+                    'branche': 'Branche',
+                    'icp_score': 'Score',
+                    'kategorie': 'Kategorie'
+                })
+
+                # Only show relevant columns for editing
+                df_display = df_icp[['HubSpot Code', 'Branche', 'Score', 'Kategorie']].copy()
+
+                edited_df = st.data_editor(
+                    df_display,
+                    column_config={
+                        "HubSpot Code": st.column_config.TextColumn(disabled=True),
+                        "Branche": st.column_config.TextColumn(disabled=True),
+                        "Score": st.column_config.NumberColumn(min_value=0, max_value=10),
+                        "Kategorie": st.column_config.TextColumn(disabled=True),
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                    height=300,
+                    key="icp_editor"
+                )
+
+                # Check for changes and save
+                if not df_display.equals(edited_df):
+                    # Find changed rows
+                    changes = []
+                    for idx, (orig, new) in enumerate(zip(df_display.itertuples(), edited_df.itertuples())):
+                        if orig.Score != new.Score:
+                            changes.append({
+                                'hubspot_code': orig._1,  # HubSpot Code
+                                'icp_score': new.Score
+                            })
+
+                    if changes:
+                        updated = db.bulk_update_icp_scores(changes)
+                        st.success(f"✅ {updated} Scores aktualisiert")
+
+            # Job Level Gewichtung Sub-Section
+            st.markdown("---")
+            st.markdown("**Job Level Gewichtung**")
+
+            joblevel_count = db.get_joblevel_score_count()
+            st.caption(f"{joblevel_count} Job Levels in der Datenbank")
+
+            col_jl_import, _ = st.columns([1, 2])
+            with col_jl_import:
+                if st.button("📥 CSV importieren", use_container_width=True,
+                            help="Importiert Job Level Scores aus Job_Level_Gewichtung.csv",
+                            key="import_joblevel"):
+                    try:
+                        imported = db.import_joblevel_scores_from_csv("Job_Level_Gewichtung.csv")
+                        st.success(f"✅ {imported} Job Levels importiert")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Import fehlgeschlagen: {e}")
+
+            if joblevel_count > 0:
+                joblevel_scores = db.get_all_joblevel_scores()
+                df_jl = pd.DataFrame(joblevel_scores)
+
+                # Rename columns for display
+                df_jl = df_jl.rename(columns={
+                    'job_level': 'Job Level',
+                    'score': 'Score'
+                })
+
+                # Only show relevant columns for editing
+                df_jl_display = df_jl[['Job Level', 'Score']].copy()
+
+                edited_jl_df = st.data_editor(
+                    df_jl_display,
+                    column_config={
+                        "Job Level": st.column_config.TextColumn(disabled=True),
+                        "Score": st.column_config.NumberColumn(min_value=0, max_value=10),
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                    height=200,
+                    key="joblevel_editor"
+                )
+
+                # Check for changes and save
+                if not df_jl_display.equals(edited_jl_df):
+                    # Find changed rows
+                    jl_changes = []
+                    for idx, (orig, new) in enumerate(zip(df_jl_display.itertuples(), edited_jl_df.itertuples())):
+                        if orig.Score != new.Score:
+                            jl_changes.append({
+                                'job_level': orig._1,  # Job Level
+                                'score': new.Score
+                            })
+
+                    if jl_changes:
+                        updated = db.bulk_update_joblevel_scores(jl_changes)
+                        st.success(f"✅ {updated} Job Level Scores aktualisiert")
 
             # Notes Analysis Sub-Section
             st.markdown("---")

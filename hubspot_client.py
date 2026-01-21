@@ -241,6 +241,131 @@ class HubSpotClient:
             return False
         # Let other errors propagate - they indicate issues that should be handled
 
+    def get_all_contacts(self, properties: List[str], limit: int = 100) -> List[Dict]:
+        """Fetch all contacts with specified properties using cursor-based pagination.
+
+        Args:
+            properties: List of property names to fetch (e.g., ['jobtitle', 'hs_seniority'])
+            limit: Number of contacts per page (max 100)
+
+        Returns:
+            List of contact dicts with 'id' and 'properties' keys
+
+        Example:
+            contacts = client.get_all_contacts(['jobtitle', 'hs_seniority'])
+            for contact in contacts:
+                print(contact['id'], contact['properties'].get('jobtitle'))
+        """
+        all_contacts = []
+        after = None
+
+        # Build properties query string
+        properties_param = ','.join(properties)
+
+        while True:
+            endpoint = f"/crm/v3/objects/contacts?limit={limit}&properties={properties_param}"
+            if after:
+                endpoint += f"&after={after}"
+
+            response = self._make_request('GET', endpoint)
+            data = response.json()
+
+            contacts = data.get('results', [])
+            all_contacts.extend(contacts)
+
+            # Check for next page (cursor-based pagination)
+            paging = data.get('paging', {})
+            if paging.get('next', {}).get('after'):
+                after = paging['next']['after']
+            else:
+                break
+
+        return all_contacts
+
+    def get_all_contacts_with_companies(self, contact_properties: List[str],
+                                         limit: int = 100) -> List[Dict]:
+        """Fetch all contacts with their company associations.
+
+        Args:
+            contact_properties: List of contact property names to fetch
+            limit: Number of contacts per page (max 100)
+
+        Returns:
+            List of contact dicts with 'id', 'properties', and 'associations' keys.
+            The 'associations' dict contains 'companies' with list of associated company IDs.
+
+        Example:
+            contacts = client.get_all_contacts_with_companies(['industry_fit'])
+            for contact in contacts:
+                companies = contact.get('associations', {}).get('companies', {}).get('results', [])
+                for assoc in companies:
+                    print(f"Contact {contact['id']} → Company {assoc['id']}")
+        """
+        all_contacts = []
+        after = None
+
+        # Build properties query string
+        properties_param = ','.join(contact_properties)
+
+        while True:
+            endpoint = f"/crm/v3/objects/contacts?limit={limit}&properties={properties_param}&associations=companies"
+            if after:
+                endpoint += f"&after={after}"
+
+            response = self._make_request('GET', endpoint)
+            data = response.json()
+
+            contacts = data.get('results', [])
+            all_contacts.extend(contacts)
+
+            # Check for next page (cursor-based pagination)
+            paging = data.get('paging', {})
+            if paging.get('next', {}).get('after'):
+                after = paging['next']['after']
+            else:
+                break
+
+        return all_contacts
+
+    def batch_get_companies(self, company_ids: List[str],
+                            properties: List[str]) -> Dict[str, Dict]:
+        """Fetch multiple companies by ID in a single batch request.
+
+        Args:
+            company_ids: List of company IDs to fetch (max 100 per batch)
+            properties: List of property names to fetch (e.g., ['industry', 'name'])
+
+        Returns:
+            Dict mapping company_id to company data: {id: {properties: {...}}}
+
+        Example:
+            companies = client.batch_get_companies(['123', '456'], ['industry'])
+            for cid, data in companies.items():
+                print(f"Company {cid}: {data['properties'].get('industry')}")
+        """
+        if not company_ids:
+            return {}
+
+        result = {}
+
+        # Process in batches of 100
+        for i in range(0, len(company_ids), 100):
+            batch_ids = company_ids[i:i + 100]
+
+            endpoint = "/crm/v3/objects/companies/batch/read"
+            payload = {
+                "inputs": [{"id": cid} for cid in batch_ids],
+                "properties": properties
+            }
+
+            response = self._make_request('POST', endpoint, json=payload)
+            data = response.json()
+
+            for company in data.get('results', []):
+                result[company['id']] = company
+
+        return result
+
     # =========================================================================
     # Notes API Methods
     # =========================================================================
