@@ -433,7 +433,7 @@ def load_campaign_data_from_db(campaign_id: str) -> pd.DataFrame:
     if not activities_db:
         return pd.DataFrame(columns=[
             'Lead Email', 'Lead FirstName', 'Lead LastName',
-            'Company', 'Job Title',
+            'Company', 'Department', 'Job Title',
             'Activity Type', 'Activity Date', 'Details',
             'HubSpot Link', 'LinkedIn Link'
         ])
@@ -467,6 +467,7 @@ def load_campaign_data_from_db(campaign_id: str) -> pd.DataFrame:
             'Lead FirstName': activity['lead_first_name'] or '',
             'Lead LastName': activity['lead_last_name'] or '',
             'Company': activity.get('lead_company_name') or '',
+            'Department': activity.get('lead_department') or '',
             'Job Title': activity.get('lead_job_title') or '',
             'Activity Type': activity['type_display'] or activity['type'],
             'Activity Date': format_date(activity['created_at']),
@@ -699,6 +700,9 @@ def fetch_all_lead_details(api_key: str, campaign_id: str,
             company_name = (lead_details.get('companyName') or
                           lead_details.get('company') or
                           None)
+            department = (lead_details.get('department') or
+                         lead_details.get('departments') or
+                         None)
             job_title = (lead_details.get('jobTitle') or
                         lead_details.get('position') or
                         None)
@@ -709,10 +713,11 @@ def fetch_all_lead_details(api_key: str, campaign_id: str,
                 hubspot_id=hubspot_id,
                 linkedin_url=linkedin_url,
                 company_name=company_name,
+                department=department,
                 job_title=job_title
             )
 
-            if hubspot_id or linkedin_url or company_name or job_title:
+            if hubspot_id or linkedin_url or company_name or department or job_title:
                 success += 1
 
             # Small delay to respect rate limits
