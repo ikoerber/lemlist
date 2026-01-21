@@ -696,11 +696,23 @@ def fetch_all_lead_details(api_key: str, campaign_id: str,
                           lead_details.get('linkedin') or
                           lead_details.get('linkedInUrl') or
                           None)
+            company_name = (lead_details.get('companyName') or
+                          lead_details.get('company') or
+                          None)
+            job_title = (lead_details.get('jobTitle') or
+                        lead_details.get('position') or
+                        None)
 
             # Update DB using lead_id as identifier
-            db.update_lead_details(lead_id, hubspot_id=hubspot_id, linkedin_url=linkedin_url)
+            db.update_lead_details(
+                lead_id,
+                hubspot_id=hubspot_id,
+                linkedin_url=linkedin_url,
+                company_name=company_name,
+                job_title=job_title
+            )
 
-            if hubspot_id or linkedin_url:
+            if hubspot_id or linkedin_url or company_name or job_title:
                 success += 1
 
             # Small delay to respect rate limits

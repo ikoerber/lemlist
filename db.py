@@ -253,18 +253,22 @@ class LemlistDB:
                 ))
 
     def update_lead_details(self, lead_id: str, hubspot_id: Optional[str] = None,
-                           linkedin_url: Optional[str] = None):
-        """Update HubSpot ID and/or LinkedIn URL for a lead.
+                           linkedin_url: Optional[str] = None,
+                           company_name: Optional[str] = None,
+                           job_title: Optional[str] = None):
+        """Update lead details from /leads/{email} API response.
 
         Args:
             lead_id: Lemlist lead ID (primary key)
             hubspot_id: Optional HubSpot contact ID
             linkedin_url: Optional LinkedIn profile URL
+            company_name: Optional company name
+            job_title: Optional job title
 
         Uses a single UPDATE statement with COALESCE to only update
         non-NULL values while preserving existing data.
         """
-        if hubspot_id is None and linkedin_url is None:
+        if all(v is None for v in [hubspot_id, linkedin_url, company_name, job_title]):
             return  # Nothing to update
 
         with self.get_connection() as conn:
@@ -273,9 +277,11 @@ class LemlistDB:
                 UPDATE leads
                 SET hubspot_id = COALESCE(?, hubspot_id),
                     linkedin_url = COALESCE(?, linkedin_url),
+                    company_name = COALESCE(?, company_name),
+                    job_title = COALESCE(?, job_title),
                     last_updated = ?
                 WHERE lead_id = ?
-            """, (hubspot_id, linkedin_url, datetime.now(), lead_id))
+            """, (hubspot_id, linkedin_url, company_name, job_title, datetime.now(), lead_id))
 
     def get_lead(self, lead_id: str) -> Optional[Dict]:
         """Get lead by lead_id"""
