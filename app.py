@@ -433,6 +433,7 @@ def load_campaign_data_from_db(campaign_id: str) -> pd.DataFrame:
     if not activities_db:
         return pd.DataFrame(columns=[
             'Lead Email', 'Lead FirstName', 'Lead LastName',
+            'Company', 'Job Title',
             'Activity Type', 'Activity Date', 'Details',
             'HubSpot Link', 'LinkedIn Link'
         ])
@@ -465,6 +466,8 @@ def load_campaign_data_from_db(campaign_id: str) -> pd.DataFrame:
             'Lead Email': activity['lead_email'],
             'Lead FirstName': activity['lead_first_name'] or '',
             'Lead LastName': activity['lead_last_name'] or '',
+            'Company': activity.get('lead_company_name') or '',
+            'Job Title': activity.get('lead_job_title') or '',
             'Activity Type': activity['type_display'] or activity['type'],
             'Activity Date': format_date(activity['created_at']),
             'Details': activity['details'] or '',

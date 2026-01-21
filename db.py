@@ -94,6 +94,8 @@ class LemlistDB:
                     campaign_id TEXT NOT NULL,
                     first_name TEXT,
                     last_name TEXT,
+                    company_name TEXT,
+                    job_title TEXT,
                     hubspot_id TEXT,
                     linkedin_url TEXT,
                     last_updated TIMESTAMP,
@@ -101,6 +103,16 @@ class LemlistDB:
                     FOREIGN KEY (campaign_id) REFERENCES campaigns(campaign_id)
                 )
             """)
+
+            # Add columns if they don't exist (migration for existing DBs)
+            try:
+                cursor.execute("ALTER TABLE leads ADD COLUMN company_name TEXT")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            try:
+                cursor.execute("ALTER TABLE leads ADD COLUMN job_title TEXT")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
             # Activities table - references lead_id instead of email
             cursor.execute("""
@@ -204,16 +216,26 @@ class LemlistDB:
                                lead.get('linkedin') or
                                lead.get('linkedInUrl'))
 
+                # Extract company and job data
+                company_name = (lead.get('companyName') or
+                               lead.get('company_name') or
+                               lead.get('company'))
+                job_title = (lead.get('jobTitle') or
+                            lead.get('job_title') or
+                            lead.get('position'))
+
                 cursor.execute("""
                     INSERT INTO leads (
                         lead_id, email, campaign_id, first_name, last_name,
-                        hubspot_id, linkedin_url, last_updated
+                        company_name, job_title, hubspot_id, linkedin_url, last_updated
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(lead_id) DO UPDATE SET
                         email = excluded.email,
                         first_name = excluded.first_name,
                         last_name = excluded.last_name,
+                        company_name = COALESCE(excluded.company_name, leads.company_name),
+                        job_title = COALESCE(excluded.job_title, leads.job_title),
                         hubspot_id = COALESCE(excluded.hubspot_id, leads.hubspot_id),
                         linkedin_url = COALESCE(excluded.linkedin_url, leads.linkedin_url),
                         last_updated = excluded.last_updated
@@ -223,6 +245,8 @@ class LemlistDB:
                     campaign_id,
                     lead.get('firstName'),
                     lead.get('lastName'),
+                    company_name,
+                    job_title,
                     hubspot_id,
                     linkedin_url,
                     now
@@ -351,6 +375,8 @@ class LemlistDB:
                     a.*,
                     l.first_name as lead_first_name,
                     l.last_name as lead_last_name,
+                    l.company_name as lead_company_name,
+                    l.job_title as lead_job_title,
                     l.hubspot_id as lead_hubspot_id,
                     l.linkedin_url as lead_linkedin_url
                 FROM activities a
