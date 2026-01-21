@@ -47,6 +47,9 @@ class HubSpotClient:
 
     BASE_URL = "https://api.hubapi.com"
 
+    # Default timeout for API requests (seconds)
+    DEFAULT_TIMEOUT = 30
+
     def __init__(self, api_token: str):
         """Initialize HubSpot client.
 
@@ -58,7 +61,6 @@ class HubSpotClient:
             'Authorization': f'Bearer {api_token}',
             'Content-Type': 'application/json'
         })
-        self.session.timeout = 30
 
     def _make_request(self, method: str, endpoint: str,
                       max_retries: int = 3, **kwargs) -> requests.Response:
@@ -80,6 +82,10 @@ class HubSpotClient:
             HubSpotError: Other API errors
         """
         url = f"{self.BASE_URL}{endpoint}"
+
+        # Set default timeout if not specified
+        if 'timeout' not in kwargs:
+            kwargs['timeout'] = self.DEFAULT_TIMEOUT
 
         for attempt in range(max_retries):
             try:
@@ -222,6 +228,9 @@ class HubSpotClient:
 
         Returns:
             True if token is valid, False otherwise
+
+        Raises:
+            HubSpotError: For non-auth related errors (network, rate limit, etc.)
         """
         try:
             # Simple API call to verify auth
@@ -230,9 +239,7 @@ class HubSpotClient:
             return True
         except HubSpotUnauthorizedError:
             return False
-        except HubSpotError:
-            # Other errors might indicate valid token but different issue
-            return True
+        # Let other errors propagate - they indicate issues that should be handled
 
     # =========================================================================
     # Notes API Methods

@@ -30,6 +30,19 @@ FILTERED_ACTIVITY_TYPES = {'hasEmailAddress', 'conditionChosen'}
 # Key for emailsOpened: (leadEmail, emailTemplateId, sequenceStep)
 DEDUPLICATE_ACTIVITY_TYPES = {'emailsOpened'}
 
+# API Rate Limiting
+API_RATE_LIMIT_DELAY = 0.15  # Seconds between API calls to respect rate limits
+API_PAGINATION_DELAY = 0.1  # Seconds between pagination requests
+
+# Lead Processing
+MAX_LEADS_INITIAL_FETCH = 50  # Max leads to fetch HubSpot IDs for on initial load
+LEAD_BATCH_SIZE = 50  # Batch size for lead details fetching
+LEAD_BATCH_PAUSE = 2.0  # Seconds to pause between batches
+
+# HubSpot Sync
+HUBSPOT_BATCH_SIZE = 50  # Contacts per batch for HubSpot sync
+HUBSPOT_BATCH_DELAY = 0.25  # Seconds between batch API calls (4 req/sec limit)
+
 
 def deduplicate_activities(activities: List[Dict]) -> List[Dict]:
     """Remove duplicate activities based on type-specific deduplication rules.
@@ -231,7 +244,7 @@ class LemlistClient:
             offset += limit
 
             # Small delay to respect rate limits
-            time.sleep(0.1)
+            time.sleep(API_PAGINATION_DELAY)
 
         # Deduplicate activities (e.g., multiple emailsOpened from same email)
         return deduplicate_activities(all_activities)
@@ -287,7 +300,7 @@ class LemlistClient:
             offset += limit
 
             # Small delay to respect rate limits
-            time.sleep(0.1)
+            time.sleep(API_PAGINATION_DELAY)
 
         return all_campaigns
 
@@ -435,8 +448,9 @@ def load_campaign_data_from_db(campaign_id: str) -> pd.DataFrame:
     def format_hubspot_link(hubspot_id):
         """Format HubSpot ID as clickable link"""
         if hubspot_id:
-            url = f"https://app.hubspot.com/contacts/19645216/record/0-1/{hubspot_id}"
-            return url
+            account_id = os.getenv("HUBSPOT_ACCOUNT_ID", "")
+            if account_id:
+                return f"https://app.hubspot.com/contacts/{account_id}/record/0-1/{hubspot_id}"
         return ''
 
     def format_linkedin_link(linkedin_url):
@@ -503,8 +517,8 @@ def sync_campaign_data(api_key: str, campaign_id: str, force_full_reload: bool =
             st.success(f"✅ {len(leads)} eindeutige Leads extrahiert")
 
         # Fetch HubSpot IDs for leads (activities don't contain HubSpot IDs!)
-        with st.spinner(f"Lade HubSpot IDs für {min(len(leads), 50)} Leads..."):
-            leads_to_fetch = leads[:50]  # Limit to first 50 to avoid long wait
+        with st.spinner(f"Lade HubSpot IDs für {min(len(leads), MAX_LEADS_INITIAL_FETCH)} Leads..."):
+            leads_to_fetch = leads[:MAX_LEADS_INITIAL_FETCH]
             processed = 0
             success = 0
 
@@ -524,7 +538,7 @@ def sync_campaign_data(api_key: str, campaign_id: str, force_full_reload: bool =
                     processed += 1
 
                     # Small delay to respect rate limits
-                    time.sleep(0.15)
+                    time.sleep(API_RATE_LIMIT_DELAY)
 
                 except Exception as e:
                     logger.warning(f"Failed to fetch HubSpot ID for {email}: {e}")
@@ -595,7 +609,7 @@ def sync_campaign_data(api_key: str, campaign_id: str, force_full_reload: bool =
                                 success += 1
 
                             processed += 1
-                            time.sleep(0.15)
+                            time.sleep(API_RATE_LIMIT_DELAY)
 
                         except Exception as e:
                             logger.warning(f"Failed to fetch HubSpot ID for {email}: {e}")
@@ -631,7 +645,8 @@ def sync_campaign_data(api_key: str, campaign_id: str, force_full_reload: bool =
 
 
 def fetch_all_lead_details(api_key: str, campaign_id: str,
-                           batch_size: int = 50, pause_seconds: float = 2.0,
+                           batch_size: Optional[int] = None,
+                           pause_seconds: Optional[float] = None,
                            progress_callback=None) -> Dict[str, int]:
     """Fetch HubSpot IDs and LinkedIn URLs for ALL leads that don't have them yet.
 
@@ -640,13 +655,18 @@ def fetch_all_lead_details(api_key: str, campaign_id: str,
     Args:
         api_key: Lemlist API key
         campaign_id: Campaign ID
-        batch_size: Number of leads to process before pausing (default 50)
-        pause_seconds: Seconds to pause after each batch (default 2.0)
+        batch_size: Number of leads to process before pausing (default LEAD_BATCH_SIZE)
+        pause_seconds: Seconds to pause after each batch (default LEAD_BATCH_PAUSE)
         progress_callback: Optional callback function(current, total) for progress updates
 
     Returns:
         Dict with statistics: {'processed': int, 'success': int, 'failed': int}
     """
+    if batch_size is None:
+        batch_size = LEAD_BATCH_SIZE
+    if pause_seconds is None:
+        pause_seconds = LEAD_BATCH_PAUSE
+
     db = LemlistDB()
     client = LemlistClient(api_key)
 
@@ -681,7 +701,7 @@ def fetch_all_lead_details(api_key: str, campaign_id: str,
                 success += 1
 
             # Small delay to respect rate limits
-            time.sleep(0.15)
+            time.sleep(API_RATE_LIMIT_DELAY)
 
         except Exception as e:
             logger.warning(f"Failed to fetch details for {email} (lead_id={lead_id}): {e}")
@@ -705,7 +725,8 @@ def fetch_all_lead_details(api_key: str, campaign_id: str,
 
 
 def sync_to_hubspot(campaign_id: str, hubspot_token: str,
-                    batch_size: int = 50, progress_callback=None) -> Dict[str, int]:
+                    batch_size: Optional[int] = None,
+                    progress_callback=None) -> Dict[str, int]:
     """Sync lead metrics from database to HubSpot.
 
     Calculates aggregated engagement metrics for each lead and updates
@@ -714,12 +735,15 @@ def sync_to_hubspot(campaign_id: str, hubspot_token: str,
     Args:
         campaign_id: Campaign ID to sync
         hubspot_token: HubSpot Private App access token
-        batch_size: Number of contacts per batch (max 100)
+        batch_size: Number of contacts per batch (max 100, default HUBSPOT_BATCH_SIZE)
         progress_callback: Optional callback function(current, total) for progress updates
 
     Returns:
         Dict with statistics: {'processed': int, 'success': int, 'failed': int, 'skipped': int}
     """
+    if batch_size is None:
+        batch_size = HUBSPOT_BATCH_SIZE
+
     db = LemlistDB()
     hubspot = HubSpotClient(hubspot_token)
 
@@ -790,7 +814,7 @@ def sync_to_hubspot(campaign_id: str, hubspot_token: str,
             progress_callback(processed, len(leads))
 
         # Rate limit: 4 req/sec for Batch API
-        time.sleep(0.25)
+        time.sleep(HUBSPOT_BATCH_DELAY)
 
     return {
         'processed': processed,
@@ -816,60 +840,55 @@ def main():
 
     # Sidebar for inputs
     with st.sidebar:
-        st.header("🔑 Konfiguration")
-
-        # Load defaults from environment variables
-        default_api_key = os.getenv("LEMLIST_API_KEY", "")
+        # =====================================================================
+        # SECTION 1: API Keys from .env
+        # =====================================================================
+        # Load API keys from environment variables (no UI input)
+        api_key = os.getenv("LEMLIST_API_KEY", "")
         default_campaign_id = os.getenv("CAMPAIGN_ID", "")
+        hubspot_token = os.getenv("HUBSPOT_API_TOKEN", "")
 
-        # Show info if .env values are loaded
-        if default_api_key or default_campaign_id:
-            st.info("💡 Werte aus .env geladen")
+        # Show configuration status
+        st.subheader("🔑 Konfiguration")
+        if api_key:
+            st.caption("✅ Lemlist API Key geladen")
+        else:
+            st.error("❌ LEMLIST_API_KEY in .env fehlt")
 
-        api_key = st.text_input(
-            "Lemlist API Key",
-            value=default_api_key,
-            type="password",
-            help="Dein Lemlist API Key aus den Account Settings (oder in .env speichern)"
-        )
+        if hubspot_token:
+            st.caption("✅ HubSpot Token geladen")
+        else:
+            st.caption("⚠️ HUBSPOT_API_TOKEN in .env fehlt (optional)")
 
-        st.divider()
+        # =====================================================================
+        # SECTION 2: Campaign Selection
+        # =====================================================================
+        st.subheader("📋 Campaign")
 
-        # Campaign Selection
         campaign_id = None
         selected_campaign_name = None
         selected_campaign_status = None
-        use_dropdown = st.checkbox(
-            "📋 Campaign aus Liste wählen",
-            value=True,
-            help="Lade alle Campaigns und wähle aus Dropdown (empfohlen)"
-        )
 
-        if use_dropdown and api_key:
-            # Status filter
-            col1, col2 = st.columns([2, 1])
-            with col1:
-                status_filter = st.selectbox(
-                    "Status Filter",
-                    options=["Alle", "running", "draft", "paused", "ended", "archived"],
-                    index=0,
-                    help="Filtere Campaigns nach Status"
-                )
+        if api_key:
+            # Status filter in compact form
+            status_filter = st.selectbox(
+                "Status",
+                options=["Alle", "running", "draft", "paused", "ended"],
+                index=0,
+                label_visibility="collapsed"
+            )
 
             # Load campaigns
             try:
-                with st.spinner("Lade Campaigns..."):
-                    filter_status = None if status_filter == "Alle" else status_filter
-                    campaigns = load_campaigns_list(api_key, status=filter_status)
+                filter_status = None if status_filter == "Alle" else status_filter
+                campaigns = load_campaigns_list(api_key, status=filter_status)
 
                 if not campaigns:
-                    st.warning("⚠️ Keine Campaigns gefunden")
+                    st.warning("Keine Campaigns gefunden")
                 else:
-                    st.success(f"✅ {len(campaigns)} Campaigns geladen")
-
-                    # Create dropdown options with full campaign info
+                    # Create dropdown options
                     campaign_info = {
-                        f"{c.get('name', 'Unnamed')} ({c.get('status', 'unknown')})": {
+                        c.get('name', 'Unnamed'): {
                             'id': c.get('_id'),
                             'name': c.get('name', 'Unnamed'),
                             'status': c.get('status', 'unknown')
@@ -877,7 +896,7 @@ def main():
                         for c in campaigns
                     }
 
-                    # Find default selection from .env if present
+                    # Find default selection
                     default_index = 0
                     if default_campaign_id:
                         for idx, info in enumerate(campaign_info.values()):
@@ -886,10 +905,10 @@ def main():
                                 break
 
                     selected_campaign = st.selectbox(
-                        "Campaign auswählen",
+                        "Campaign",
                         options=list(campaign_info.keys()),
                         index=default_index,
-                        help="Wähle eine Campaign aus der Liste"
+                        label_visibility="collapsed"
                     )
 
                     # Extract campaign info
@@ -898,293 +917,224 @@ def main():
                     selected_campaign_name = selected_info['name']
                     selected_campaign_status = selected_info['status']
 
+                    # Show campaign badge
+                    status_emoji = {"running": "🟢", "paused": "🟡", "draft": "⚪", "ended": "🔴"}.get(selected_campaign_status, "⚫")
+                    st.caption(f"{status_emoji} {selected_campaign_status}")
+
             except UnauthorizedError:
-                st.error("❌ Ungültiger API Key")
+                st.error("❌ Ungültiger API Key in .env")
             except Exception as e:
-                st.error(f"❌ Fehler beim Laden der Campaigns: {str(e)}")
+                st.error(f"Fehler: {str(e)}")
+        else:
+            st.info("💡 LEMLIST_API_KEY in .env setzen")
 
-        elif use_dropdown and not api_key:
-            st.warning("⚠️ Bitte API Key eingeben um Campaigns zu laden")
-
-        # Fallback: Manual input
-        if not use_dropdown:
-            campaign_id = st.text_input(
-                "Campaign ID (manuell)",
-                value=default_campaign_id,
-                help="Die ID deiner Lemlist Kampagne manuell eingeben"
-            )
-
-        st.divider()
-
-        # Check if data exists in DB
+        # =====================================================================
+        # SECTION 3: Status (konsolidiert)
+        # =====================================================================
         db = LemlistDB()
         campaign_in_db = db.get_campaign(campaign_id) if campaign_id else None
         stats = db.get_campaign_stats(campaign_id) if campaign_id else None
 
-        # Show DB status
         if campaign_in_db and stats:
-            st.info(f"📊 {stats['leads']} Leads, {stats['activities']} Activities in DB")
-            if stats['last_updated']:
-                st.caption(f"Letztes Update: {stats['last_updated']}")
+            st.subheader("📈 Status")
 
-        # Sync button
+            col1, col2 = st.columns(2)
+            with col1:
+                hubspot_info = f"({stats['leads_with_hubspot']} HS)" if stats['leads_with_hubspot'] > 0 else ""
+                st.metric("Leads", f"{stats['leads']} {hubspot_info}")
+            with col2:
+                st.metric("Activities", stats['activities'])
+
+            if stats['last_updated']:
+                st.caption(f"Sync: {stats['last_updated']}")
+
+        # =====================================================================
+        # SECTION 4: Aktionen
+        # =====================================================================
+        st.subheader("🔄 Aktionen")
+
+        # Primary action - main sync button
         sync_button = st.button(
             "🔄 Daten aktualisieren",
             type="primary",
             use_container_width=True,
             disabled=not campaign_id,
-            help="Synchronisiert neue Activities von der API"
+            help="Lädt neue Activities von Lemlist"
         )
 
-        # Force reload button
-        force_reload = st.button(
-            "🔁 Vollständig neu laden",
-            use_container_width=True,
-            disabled=not campaign_id,
-            help="Löscht alle Daten und lädt alles neu"
-        )
+        # Secondary actions in columns
+        col1, col2 = st.columns(2)
+        with col1:
+            force_reload = st.button(
+                "🔁 Neu laden",
+                use_container_width=True,
+                disabled=not campaign_id,
+                help="Löscht Cache und lädt alles neu"
+            )
+        with col2:
+            # Lead details button - only show if there are leads without HubSpot
+            leads_without_hubspot = (stats['leads'] - stats['leads_with_hubspot']) if stats else 0
+            fetch_details_clicked = st.button(
+                "⬇️ Details",
+                use_container_width=True,
+                disabled=not (campaign_in_db and leads_without_hubspot > 0),
+                help=f"Lädt HubSpot IDs für {leads_without_hubspot} Leads" if leads_without_hubspot > 0 else "Alle Leads haben bereits Details"
+            )
 
-        st.divider()
+        # Handle lead details fetch
+        if fetch_details_clicked and leads_without_hubspot > 0:
+            progress_bar = st.progress(0, text="Lade Lead Details...")
 
-        # Background fetch for HubSpot/LinkedIn data
-        if campaign_in_db and stats:
-            leads_without_hubspot = stats['leads'] - stats['leads_with_hubspot']
-            if leads_without_hubspot > 0:
-                st.warning(f"⚠️ {leads_without_hubspot} Leads ohne HubSpot/LinkedIn Daten")
-                if st.button("⬇️ Alle Lead Details laden", use_container_width=True,
-                            help=f"Holt HubSpot IDs und LinkedIn URLs für alle {leads_without_hubspot} Leads (Pause alle 50 Leads)"):
-                    progress_bar = st.progress(0, text="Lade Lead Details...")
+            def update_lead_progress(current, total):
+                progress = current / total if total > 0 else 0
+                progress_bar.progress(progress, text=f"Lade... {current}/{total}")
 
-                    def update_lead_progress(current, total):
-                        progress = current / total if total > 0 else 0
-                        progress_bar.progress(progress, text=f"Lade Lead Details... {current}/{total} (Pause alle 50 Leads)")
+            result = fetch_all_lead_details(
+                api_key,
+                campaign_id,
+                batch_size=LEAD_BATCH_SIZE,
+                pause_seconds=LEAD_BATCH_PAUSE,
+                progress_callback=update_lead_progress
+            )
+            progress_bar.empty()
 
-                    result = fetch_all_lead_details(
-                        api_key,
-                        campaign_id,
-                        batch_size=50,
-                        pause_seconds=2.0,
-                        progress_callback=update_lead_progress
-                    )
-                    progress_bar.empty()
+            st.success(f"✅ {result['success']} von {result['processed']} erfolgreich")
+            if result['failed'] > 0:
+                st.warning(f"⚠️ {result['failed']} fehlgeschlagen")
+            st.rerun()
 
-                    st.success(f"✅ {result['processed']} Leads verarbeitet, {result['success']} mit Daten gefunden")
-                    if result['failed'] > 0:
-                        st.warning(f"⚠️ {result['failed']} Leads fehlgeschlagen")
-                    st.rerun()
-            else:
-                st.success("✅ Alle Leads haben HubSpot/LinkedIn Daten")
+        # Show hint if leads missing HubSpot data
+        if stats and leads_without_hubspot > 0:
+            st.caption(f"💡 {leads_without_hubspot} Leads ohne HubSpot IDs")
 
-        st.divider()
+        # =====================================================================
+        # SECTION 5: HubSpot Integration (Expander)
+        # =====================================================================
+        # hubspot_token already loaded from env at start of sidebar
 
-        # HubSpot Sync Section
-        st.header("🔄 HubSpot Sync")
+        with st.expander("🔗 HubSpot Integration", expanded=False):
+            # Show sync status
+            leads_with_hubspot = stats.get('leads_with_hubspot', 0) if stats else 0
 
-        # Load HubSpot token from .env
-        default_hubspot_token = os.getenv("HUBSPOT_API_TOKEN", "")
+            if not hubspot_token:
+                st.warning("⚠️ HUBSPOT_API_TOKEN in .env setzen")
+            elif leads_with_hubspot > 0:
+                st.caption(f"✅ {leads_with_hubspot} Leads bereit für Sync")
+            elif campaign_in_db:
+                st.caption("⚠️ Erst Lead Details laden")
 
-        hubspot_token = st.text_input(
-            "HubSpot API Token",
-            value=default_hubspot_token,
-            type="password",
-            help="Private App Token aus HubSpot Settings → Integrations → Private Apps"
-        )
+            # Sync button with clear disabled reason
+            sync_to_hubspot_disabled = not (campaign_id and hubspot_token and leads_with_hubspot > 0)
 
-        # Show sync readiness
-        if campaign_in_db and stats:
-            leads_with_hubspot = stats.get('leads_with_hubspot', 0)
-            if leads_with_hubspot > 0:
-                st.info(f"ℹ️ {leads_with_hubspot} Leads bereit für HubSpot Sync")
-            else:
-                st.warning("⚠️ Keine Leads mit HubSpot IDs gefunden. Bitte erst 'Lead Details laden'.")
+            if st.button("⬆️ Nach HubSpot syncen", use_container_width=True, disabled=sync_to_hubspot_disabled):
+                try:
+                    hubspot_client = HubSpotClient(hubspot_token)
+                    if not hubspot_client.verify_token():
+                        st.error("Ungültiger Token")
+                    else:
+                        progress_bar = st.progress(0, text="Synchronisiere...")
 
-        # Sync button
-        sync_to_hubspot_disabled = not (campaign_id and hubspot_token and stats and stats.get('leads_with_hubspot', 0) > 0)
-        if st.button("⬆️ Nach HubSpot syncen", use_container_width=True, disabled=sync_to_hubspot_disabled,
-                     help="Synchronisiert Engagement-Metriken zu HubSpot Custom Properties"):
-            try:
-                # Verify token first
-                hubspot_client = HubSpotClient(hubspot_token)
-                if not hubspot_client.verify_token():
-                    st.error("❌ Ungültiger HubSpot API Token")
-                else:
-                    # Create progress bar
-                    progress_bar = st.progress(0, text="Synchronisiere Metriken zu HubSpot...")
+                        def update_progress(current, total):
+                            progress = current / total if total > 0 else 0
+                            progress_bar.progress(progress, text=f"Sync... {current}/{total}")
 
-                    def update_progress(current, total):
-                        progress = current / total if total > 0 else 0
-                        progress_bar.progress(progress, text=f"Synchronisiere... {current}/{total} Leads")
+                        result = sync_to_hubspot(
+                            campaign_id,
+                            hubspot_token,
+                            batch_size=HUBSPOT_BATCH_SIZE,
+                            progress_callback=update_progress
+                        )
+                        progress_bar.empty()
 
-                    # Run sync
-                    result = sync_to_hubspot(
-                        campaign_id,
-                        hubspot_token,
-                        batch_size=50,
-                        progress_callback=update_progress
-                    )
+                        if result['success'] > 0:
+                            st.success(f"✅ {result['success']}/{result['processed']} gesynct")
+                        if result['failed'] > 0:
+                            st.warning(f"⚠️ {result['failed']} fehlgeschlagen")
 
-                    progress_bar.empty()
+                except HubSpotUnauthorizedError:
+                    st.error("Ungültiger Token")
+                except HubSpotRateLimitError as e:
+                    st.error(f"Rate Limit - warte {e.retry_after}s")
+                except HubSpotError as e:
+                    st.error(f"Fehler: {str(e)}")
 
-                    # Show results
-                    if result['success'] > 0:
-                        st.success(f"✅ {result['success']} von {result['processed']} Leads erfolgreich gesynct")
+            # Notes Analysis Sub-Section
+            st.markdown("---")
+            st.markdown("**Notes Analyse**")
 
-                    if result['failed'] > 0:
-                        st.warning(f"⚠️ {result['failed']} Leads fehlgeschlagen")
+            notes_analysis_disabled = not (campaign_id and hubspot_token and leads_with_hubspot > 0)
 
-                    if result['skipped'] > 0:
-                        st.info(f"ℹ️ {result['skipped']} Leads ohne Activities übersprungen")
-
-            except HubSpotUnauthorizedError:
-                st.error("❌ Ungültiger HubSpot API Token")
-            except HubSpotRateLimitError as e:
-                st.error(f"❌ HubSpot Rate Limit erreicht. Bitte warte {e.retry_after}s und versuche es erneut.")
-            except HubSpotError as e:
-                st.error(f"❌ HubSpot Fehler: {str(e)}")
-            except Exception as e:
-                st.error(f"❌ Fehler beim Sync: {str(e)}")
-                with st.expander("🔍 Details"):
-                    st.exception(e)
-
-        st.divider()
-
-        # HubSpot Notes Analysis Section
-        with st.expander("🔍 HubSpot Notes Analyse", expanded=False):
-            st.caption("Analysiere Lemlist Notes in HubSpot und finde Duplikate")
-
-            notes_analysis_disabled = not (campaign_id and hubspot_token and stats and stats.get('leads_with_hubspot', 0) > 0)
-
-            if st.button("📥 Notes von HubSpot laden", use_container_width=True,
-                        disabled=notes_analysis_disabled,
-                        help="Lädt alle Notes für Leads in dieser Campaign"):
+            if st.button("📥 Notes laden", use_container_width=True, disabled=notes_analysis_disabled):
                 try:
                     hubspot_client = HubSpotClient(hubspot_token)
                     analyzer = NotesAnalyzer(hubspot_client, db)
 
-                    progress_bar = st.progress(0, text="Lade Notes von HubSpot...")
+                    progress_bar = st.progress(0, text="Lade Notes...")
 
                     def update_notes_progress(current, total):
                         progress = current / total if total > 0 else 0
-                        progress_bar.progress(progress, text=f"Lade Notes... {current}/{total} Leads")
+                        progress_bar.progress(progress, text=f"Notes... {current}/{total}")
 
                     notes = analyzer.fetch_all_notes(campaign_id, progress_callback=update_notes_progress)
                     progress_bar.empty()
 
-                    # Store in session state
                     st.session_state['hubspot_notes'] = notes
                     st.session_state['notes_campaign_id'] = campaign_id
 
-                    # Count Lemlist notes vs total
                     lemlist_notes = [n for n in notes if n.get('parsed')]
-                    st.success(f"✅ {len(notes)} Notes geladen ({len(lemlist_notes)} Lemlist Notes)")
+                    st.success(f"✅ {len(lemlist_notes)} Lemlist Notes")
 
                 except HubSpotError as e:
-                    st.error(f"❌ HubSpot Fehler: {str(e)}")
-                except Exception as e:
-                    st.error(f"❌ Fehler: {str(e)}")
+                    st.error(f"Fehler: {str(e)}")
 
-            # Show analysis if notes are loaded
+            # Show analysis if notes loaded
             if 'hubspot_notes' in st.session_state and st.session_state.get('notes_campaign_id') == campaign_id:
                 notes = st.session_state['hubspot_notes']
-                lemlist_notes = [n for n in notes if n.get('parsed')]
 
-                st.markdown("---")
-                st.markdown(f"**{len(lemlist_notes)} Lemlist Notes** von {len(notes)} total")
-
-                # Find duplicates
-                hubspot_client = HubSpotClient(hubspot_token) if hubspot_token else None
-                if hubspot_client:
+                if hubspot_token:
+                    hubspot_client = HubSpotClient(hubspot_token)
                     analyzer = NotesAnalyzer(hubspot_client, db)
                     duplicates = analyzer.find_duplicates(notes)
                     dup_stats = analyzer.get_duplicate_stats(duplicates)
 
                     if duplicates:
-                        st.warning(f"⚠️ {dup_stats['total_duplicate_groups']} Duplikat-Gruppen gefunden")
-                        st.caption(f"{dup_stats['total_to_delete']} Notes können gelöscht werden")
+                        st.warning(f"⚠️ {dup_stats['total_to_delete']} Duplikate")
 
-                        # Show duplicate details
-                        with st.expander(f"📋 Duplikate anzeigen ({len(duplicates)} Gruppen)"):
-                            for i, group in enumerate(duplicates[:10]):  # Limit to first 10
-                                parsed = group[0].get('parsed', {})
-                                st.markdown(f"**{i+1}. {group[0].get('lead_email', 'Unknown')}**")
-                                st.caption(f"{parsed.get('activity_text', 'Unknown')} - {parsed.get('campaign', '')} (step {parsed.get('step', '?')})")
-                                st.caption(f"📝 {len(group)} Notes (davon {len(group)-1} Duplikate)")
-                                st.markdown("---")
-
-                            if len(duplicates) > 10:
-                                st.caption(f"... und {len(duplicates) - 10} weitere Gruppen")
-
-                        # Delete button
-                        if st.button("🗑️ Alle Duplikate löschen (neueste behalten)",
-                                    use_container_width=True,
-                                    type="secondary"):
+                        if st.button("🗑️ Duplikate löschen", use_container_width=True):
                             try:
-                                progress_bar = st.progress(0, text="Lösche Duplikate...")
-
-                                def update_delete_progress(current, total):
-                                    progress = current / total if total > 0 else 0
-                                    progress_bar.progress(progress, text=f"Lösche... {current}/{total}")
-
+                                progress_bar = st.progress(0)
                                 result = analyzer.delete_duplicates(
-                                    duplicates,
-                                    keep_newest=True,
-                                    progress_callback=update_delete_progress
+                                    duplicates, keep_newest=True,
+                                    progress_callback=lambda c, t: progress_bar.progress(c/t if t > 0 else 0)
                                 )
                                 progress_bar.empty()
-
-                                st.success(f"✅ {result['deleted']} Duplikate gelöscht")
-                                if result['failed'] > 0:
-                                    st.warning(f"⚠️ {result['failed']} konnten nicht gelöscht werden")
-
-                                # Clear cached notes
+                                st.success(f"✅ {result['deleted']} gelöscht")
                                 del st.session_state['hubspot_notes']
-
                             except Exception as e:
-                                st.error(f"❌ Fehler: {str(e)}")
+                                st.error(str(e))
                     else:
-                        st.success("✅ Keine Duplikate gefunden")
+                        st.success("✅ Keine Duplikate")
 
-                    # DB Comparison
-                    st.markdown("---")
-                    st.markdown("**📊 Vergleich mit Datenbank**")
-
+                    # DB Comparison compact
                     comparison = analyzer.compare_with_db(notes, campaign_id)
                     comp_stats = comparison['stats']
+                    st.caption(f"DB Match: {comp_stats['matched_count']} | Diff: {comp_stats['notes_only_count'] + comp_stats['db_only_count']}")
 
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("✅ Match", comp_stats['matched_count'])
-                    col2.metric("📝 Nur Notes", comp_stats['notes_only_count'])
-                    col3.metric("📊 Nur DB", comp_stats['db_only_count'])
+        # =====================================================================
+        # SECTION 6: Wartung (Expander)
+        # =====================================================================
+        with st.expander("⚙️ Wartung", expanded=False):
+            st.caption("Daten werden lokal in SQLite gespeichert")
 
-                    if comp_stats['notes_only_count'] > 0:
-                        with st.expander(f"Notes ohne DB-Eintrag ({comp_stats['notes_only_count']})"):
-                            for note in comparison['in_notes_not_db'][:10]:
-                                if note:
-                                    parsed = note.get('parsed', {})
-                                    st.caption(f"• {note.get('lead_email', '?')} - {parsed.get('activity_text', '?')}")
-
-                    if comp_stats['db_only_count'] > 0:
-                        with st.expander(f"DB-Activities ohne Note ({comp_stats['db_only_count']})"):
-                            for activity in comparison['in_db_not_notes'][:10]:
-                                if activity:
-                                    st.caption(f"• {activity.get('lead_email', '?')} - {activity.get('type', '?')}")
-
-        st.divider()
-
-        # DB control
-        if st.button("🗑️ Datenbank leeren", use_container_width=True):
-            if campaign_id:
-                db.clear_campaign_data(campaign_id)
-                st.success("Datenbank geleert!")
-            # Also clear session state
-            if 'df' in st.session_state:
-                st.session_state.df = None
-            if 'current_campaign_id' in st.session_state:
-                st.session_state.current_campaign_id = None
-            st.rerun()
-
-        st.divider()
-        st.caption("💡 Tipp: Daten werden lokal in SQLite gespeichert")
+            if st.button("🗑️ Datenbank leeren", use_container_width=True, type="secondary"):
+                if campaign_id:
+                    db.clear_campaign_data(campaign_id)
+                    st.success("Datenbank geleert!")
+                if 'df' in st.session_state:
+                    st.session_state.df = None
+                if 'current_campaign_id' in st.session_state:
+                    st.session_state.current_campaign_id = None
+                st.rerun()
 
     # Main content
     # Initialize session state for data persistence
@@ -1196,11 +1146,11 @@ def main():
     # Sync data when button is clicked
     if sync_button or force_reload:
         if not api_key:
-            st.error("❌ Bitte API Key eingeben")
+            st.error("❌ LEMLIST_API_KEY fehlt in .env")
             return
 
         if not campaign_id:
-            st.error("❌ Bitte Campaign ID eingeben")
+            st.error("❌ Bitte Campaign auswählen")
             return
 
         try:
@@ -1223,7 +1173,7 @@ def main():
                 return
 
         except UnauthorizedError:
-            st.error("❌ Ungültiger API Key. Bitte überprüfe deinen API Key.")
+            st.error("❌ Ungültiger LEMLIST_API_KEY in .env")
             st.session_state.df = None
             return
         except NotFoundError:
@@ -1398,29 +1348,27 @@ def main():
         with col2:
             st.metric("Zeilen im Export", len(filtered_df))
     else:
-        # Show instructions when no data loaded
-        st.info("👈 Bitte API Key und Campaign ID in der Sidebar eingeben und auf 'Daten laden' klicken")
+        # Prominent empty state with clear instructions
+        st.markdown("""
+        ### 👋 Willkommen!
 
-        with st.expander("📖 Anleitung"):
-            st.markdown("""
-            ### So verwendest du diese App:
+        **So startest du:**
 
-            1. **API Key holen**: Gehe zu deinen Lemlist Account Settings und kopiere deinen API Key
-            2. **Campaign ID finden**: Öffne deine Kampagne in Lemlist - die ID steht in der URL
-            3. **Daten laden**: Gib beide Werte in der Sidebar ein und klicke auf "Daten laden"
-            4. **Export**: Nach dem Laden kannst du die Daten als CSV herunterladen
+        1. **.env Datei** konfigurieren (siehe .env.example)
+        2. **Campaign** auswählen (Sidebar links)
+        3. **🔄 Daten aktualisieren** klicken
 
-            ### Features:
-            - ✅ Automatische Pagination (alle Leads & Activities)
-            - ✅ Rate Limit Handling mit Auto-Retry
-            - ✅ 1-Stunden Cache für schnellere Wiederholung
-            - ✅ Activity Type Filtering
-            - ✅ CSV Export mit Timestamp
+        Die Daten werden lokal gespeichert und sind beim nächsten Start sofort verfügbar.
+        """)
 
-            ### Performance:
-            - Typische Kampagne (500 Leads): ~5-10 Sekunden
-            - Cache-Hit: < 1 Sekunde
-            """)
+        # Show quick tips
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.info("**📊 .env Konfiguration**\n\nKopiere .env.example → .env")
+        with col2:
+            st.info("**🔑 API Keys**\n\nLemlist + HubSpot in .env")
+        with col3:
+            st.info("**💾 Lokal gespeichert**\n\nDaten bleiben erhalten")
 
 
 if __name__ == "__main__":

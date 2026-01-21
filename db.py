@@ -530,8 +530,8 @@ class LemlistDB:
         emails_clicked = type_counts.get('emailsClicked', 0)
         emails_replied = type_counts.get('emailsReplied', 0)
 
-        # Calculate open rate
-        email_open_rate = round((emails_opened / emails_sent) * 100, 1) if emails_sent > 0 else 0
+        # Calculate open rate (as decimal for HubSpot Percentage property: 0.5 = 50%)
+        email_open_rate = round(emails_opened / emails_sent, 3) if emails_sent > 0 else 0
 
         # LinkedIn metrics
         linkedin_visits = type_counts.get('linkedinVisitDone', 0)
@@ -620,7 +620,7 @@ class LemlistDB:
             'lemlist_linkedin_messages_sent': linkedin_messages_sent,
             'lemlist_linkedin_messages_opened': linkedin_messages_opened,
 
-            # Engagement
+            # Engagement (HubSpot Percentage properties expect 0-100, e.g. 30 for 30%)
             'lemlist_engagement_score': engagement_score,
             'lemlist_lead_status': lead_status,
             'lemlist_last_sync_date': format_date_as_timestamp(datetime.now(timezone.utc)),  # HubSpot date fields require midnight UTC
