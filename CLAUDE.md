@@ -12,7 +12,7 @@ Streamlit application for extracting and analyzing data from the Lemlist API. Th
 - **Streamlit**: Web UI framework
 - **SQLite**: Local database for caching campaign data
 - **Pandas**: Data manipulation and export
-- **Requests**: HTTP client for Lemlist API calls
+- **Requests**: HTTP client for API calls
 
 ## Running the Application
 
@@ -89,6 +89,10 @@ All API requests require ONLY an API key (no User ID or Email needed):
 - `first_name`, `last_name` (TEXT): Lead names
 - `hubspot_id` (TEXT): HubSpot contact ID (nullable)
 - `linkedin_url` (TEXT): LinkedIn profile URL (nullable)
+- `company_name` (TEXT): Company name from Lemlist
+- `job_title` (TEXT): Job title from Lemlist
+- `job_level` (TEXT): Calculated job level (owner, director, manager, senior, employee)
+- `department` (TEXT): Calculated department (Executive, Finance, IT, Marketing, Sales, etc.)
 - `last_updated` (DATETIME): Last update timestamp
 
 **Note**: Using `lead_id` as PRIMARY KEY allows the same email to exist in multiple campaigns (each with a unique `lead_id`). This is how Lemlist models leads internally.
@@ -193,29 +197,105 @@ DEDUPLICATE_ACTIVITY_TYPES = {'emailsOpened'}
 - Keeps first occurrence (removes duplicate tracking pixel loads)
 - Called automatically in `get_all_activities()`
 
-### LemlistClient Class (`app.py`)
-Session-based HTTP client with Basic Auth:
-- `_make_request()`: Centralized request handler with rate limit monitoring, retry logic, timeout handling
-- `get_all_campaigns(status)`: Fetches campaigns with optional status filter (pagination)
-- `get_all_activities(campaign_id)`: Fetches ALL activities with campaignId filter (pagination), automatically filters and deduplicates
-- `get_lead_details(email)`: Fetches detailed lead info including hubspotLeadId (rate limited)
+### API Clients Package (`api_clients/`)
+
+Reusable API client implementations:
+
+**BaseAPIClient** (`base_client.py`):
+- HTTP request handling with retries
+- Rate limit management
+- Error handling with custom exceptions
+
+**HubSpotClient** (`hubspot.py`):
+- `verify_token()`: Check if token is valid
+- `update_contact_properties()`: Update single contact
+- `batch_update_contacts()`: Batch update up to 100 contacts
+- `get_notes_for_contact()`: Fetch notes for a contact
+- `batch_delete_notes()`: Delete multiple notes
+
+**LemlistClient** (`lemlist.py`):
+- `get_all_campaigns()`: Fetch campaigns with pagination
+- `get_all_activities()`: Fetch activities with campaignId filter
+- `get_lead_details()`: Fetch detailed lead info
+
+**StreamlitWrappers** (`streamlit_wrappers.py`):
+- `StreamlitHubSpotClient`: HubSpot client with st.warning() notifications
+- `StreamlitLemlistClient`: Lemlist client with st.warning() notifications
 
 ### LemlistDB Class (`db.py`)
 SQLite database layer for local caching:
 - `get_connection()`: Context manager for DB connections
 - `upsert_campaign()`: Insert/update campaign record
-- `upsert_leads()`: Bulk insert/update leads using `lead_id` as key (extracts hubspot_id, linkedin_url)
+- `upsert_leads()`: Bulk insert/update leads using `lead_id` as key
 - `upsert_activities()`: Bulk insert/update activities (requires `leadId` for FK)
-- `get_activities_by_campaign()`: Returns activities with LEFT JOIN on leads via `lead_id`
-- `get_activities_by_lead(lead_id)`: Get all activities for a specific lead
-- `get_activities_by_email(email)`: Get all activities across campaigns for an email (for HubSpot sync)
+- `get_activities_by_campaign()`: Returns activities with LEFT JOIN on leads
 - `get_campaign_stats()`: Returns metrics (lead count, activity count, hubspot coverage)
-- `get_latest_activity_date()`: Returns timestamp of newest activity (for incremental updates)
-- `get_leads_without_hubspot_id()`: Returns list of dicts with `lead_id` and `email` needing enrichment
-- `get_lead(lead_id)`: Get lead by Lemlist lead_id
-- `get_lead_by_email(email, campaign_id)`: Get lead by email within a specific campaign
-- `update_lead_details(lead_id)`: Updates hubspot_id and linkedin_url for a lead by lead_id
+- `get_latest_activity_date()`: Returns timestamp of newest activity
+- `get_leads_without_hubspot_id()`: Returns leads needing enrichment
+- `get_leads_with_job_level()`: Returns leads with hubspot_id and job_level
+- `get_leads_with_department()`: Returns leads with hubspot_id and department
+- `update_lead_details()`: Updates hubspot_id, linkedin_url, job_level, department
 - `clear_campaign_data()`: Deletes all data for a campaign
+
+### Job Level Classification (`app.py`)
+
+Automatic classification of job titles to HubSpot-compatible seniority levels:
+
+```python
+JOB_LEVEL_KEYWORDS = {
+    'owner': ['ceo', 'cto', 'cfo', 'chief', 'geschäftsführer', 'vorstand', ...],
+    'director': ['director', 'vp', 'vice president', 'head of', 'leiter', ...],
+    'manager': ['manager', 'teamleiter', 'lead', 'supervisor', ...],
+    'senior': ['senior', 'sr', 'principal', 'expert', ...],
+    'employee': []  # Default fallback
+}
+
+JOB_LEVEL_TO_HUBSPOT_SENIORITY = {
+    'owner': 'owner',
+    'director': 'director',
+    'manager': 'manager',
+    'senior': 'senior',
+    'employee': 'employee'
+}
+```
+
+**`calculate_job_level(job_title)`**: Returns job level based on keyword matching
+
+### Department Classification (`app.py`)
+
+Automatic classification of job titles to departments:
+
+```python
+DEPARTMENT_KEYWORDS = {
+    'Executive': ['ceo', 'cto', 'cfo', 'chief', 'geschäftsführer', ...],
+    'Finance': ['finance', 'finanz', 'accounting', 'controller', ...],
+    'Procurement': ['procurement', 'einkauf', 'purchasing', 'buyer', ...],
+    'Engineering': ['engineer', 'ingenieur', 'develop', 'software', ...],
+    'IT': ['it', 'information tech', 'network', 'cloud', 'digital', ...],
+    'Operations': ['operation', 'project manag', 'quality', 'logist', 'assistenz', ...],
+    'Production': ['production', 'produktion', 'manufactur', 'maintenance', ...],
+    'Marketing': ['marketing', 'brand', 'communication', 'content', 'seo', ...],
+    'Sales': ['sales', 'vertrieb', 'account', 'business develop', 'e-commerce', ...],
+    'HR': ['human resource', 'hr', 'personal', 'recruit', 'talent', ...],
+    'Legal': ['legal', 'recht', 'compliance', 'contract', 'datenschutz', ...]
+}
+
+DEPARTMENT_TO_HUBSPOT_ROLE = {
+    'Finance': 'FINANCE',
+    'Procurement': 'Procurement',
+    'Engineering': 'Engineering',
+    'IT': 'IT',
+    'Executive': 'Executive',
+    'Operations': 'Operations',
+    'Production': 'Production',
+    'Marketing': 'Marketing',
+    'Sales': 'Sales',
+    'HR': 'HR',
+    'Legal': 'Legal'
+}
+```
+
+**`calculate_department(job_title)`**: Returns department based on keyword matching
 
 ### Core Functions (`app.py`)
 
@@ -224,9 +304,10 @@ Main sync logic with two modes:
 
 1. **First Load / Full Reload**:
    - Fetch ALL activities from API (pagination)
-   - Extract leads from activities using `leadId` as unique key (also: leadEmail, leadFirstName, etc.)
-   - Fetch HubSpot IDs for first 50 leads via `/leads/{email}` (0.15s delay between calls)
-   - Save leads and activities to DB (using lead_id as FK)
+   - Extract leads from activities using `leadId` as unique key
+   - Calculate job_level and department from job_title
+   - Fetch HubSpot IDs for first 50 leads via `/leads/{email}`
+   - Save leads and activities to DB
    - Return data from DB
 
 2. **Incremental Update**:
@@ -237,19 +318,26 @@ Main sync logic with two modes:
    - Save new leads and activities to DB
    - Return data from DB
 
-**`load_campaign_data_from_db(campaign_id)`**
-- Calls `db.get_activities_by_campaign()` (LEFT JOIN)
-- Formats HubSpot links: `https://app.hubspot.com/contacts/19645216/record/0-1/{hubspot_id}`
-- Returns Pandas DataFrame sorted by date (oldest first)
-
-**`fetch_all_lead_details(api_key, campaign_id, batch_size=50, pause_seconds=2.0, progress_callback=None)`**
+**`fetch_all_lead_details(api_key, campaign_id)`**
 - Gets ALL leads without HubSpot ID from DB
-- Fetches HubSpot IDs via `/leads/{email}` for ALL leads automatically
-- Pauses for `pause_seconds` every `batch_size` leads (rate limit protection)
-- Updates DB with fetched HubSpot IDs
+- Fetches HubSpot IDs via `/leads/{email}` for ALL leads
+- Calculates job_level and department from job_title
+- Updates DB with fetched data
 - Returns statistics (processed, success, failed)
-- Used by "⬇️ Alle Lead Details laden" button
-- Shows progress bar during fetching
+
+**`sync_job_levels_to_hubspot(hubspot_token, campaign_id)`**
+- Gets leads from local DB with hubspot_id and job_level
+- Checks current hs_seniority in HubSpot (batch read)
+- Only updates contacts where hs_seniority is NOT set
+- Does NOT overwrite existing HubSpot data
+- Returns statistics (total, updated, skipped, failed)
+
+**`sync_departments_to_hubspot(hubspot_token, campaign_id)`**
+- Gets leads from local DB with hubspot_id and department
+- Checks current hs_role in HubSpot (batch read)
+- Only updates contacts where hs_role is NOT set
+- Does NOT overwrite existing HubSpot data
+- Returns statistics (total, updated, skipped, failed)
 
 ### Data Flow
 
@@ -265,14 +353,22 @@ Main sync logic with two modes:
    - Slower (15-20 seconds for 1500+ activities)
 
 3. User clicks **"⬇️ Alle Lead Details laden"**:
-   - `fetch_all_lead_details(api_key, campaign_id, batch_size=50, pause_seconds=2.0)`
-   - Fetches HubSpot IDs for ALL leads automatically
-   - Shows progress bar during fetching
-   - Pauses 2 seconds every 50 leads (rate limit protection)
+   - `fetch_all_lead_details(api_key, campaign_id)`
+   - Fetches HubSpot IDs for ALL leads
+   - Calculates job_level and department
    - Updates DB in place
-   - UI refreshes to show new HubSpot links
 
-4. **Display**:
+4. User clicks **"🎯 Job Levels syncen"**:
+   - `sync_job_levels_to_hubspot(hubspot_token, campaign_id)`
+   - Syncs job_level to HubSpot hs_seniority
+   - Only for Lemlist leads, only if hs_seniority is empty
+
+5. User clicks **"🏢 Departments syncen"**:
+   - `sync_departments_to_hubspot(hubspot_token, campaign_id)`
+   - Syncs department to HubSpot hs_role
+   - Only for Lemlist leads, only if hs_role is empty
+
+6. **Display**:
    - `load_campaign_data_from_db(campaign_id)` → DataFrame
    - Apply filters (lead, activity type)
    - Show in Streamlit with LinkColumn for HubSpot and LinkedIn
@@ -287,19 +383,19 @@ Main sync logic with two modes:
 - API credentials entered via UI (password input) or loaded from .env, never hardcoded
 - **Database**: SQLite file `lemlist_data.db` created in project root (excluded from git)
 - **Performance**:
-  - First sync: 15-20 seconds for 1500+ activities (includes HubSpot fetching for 50 leads)
+  - First sync: 15-20 seconds for 1500+ activities
   - Incremental update: < 5 seconds (only new activities)
   - Loading from DB: < 1 second (instant display)
-  - HubSpot batch fetch: ~8 seconds for 50 leads (0.15s delay per lead)
-- **Lead extraction**: Leads are extracted from activities response, NOT from `/campaigns/{id}/leads` (which returns empty)
-- **HubSpot IDs**: Only available via `/leads/{email}` endpoint, not in activities response
+- **Lead extraction**: Leads are extracted from activities response, NOT from `/campaigns/{id}/leads`
+- **HubSpot IDs**: Only available via `/leads/{email}` endpoint
 - **Incremental updates**: Tracks latest activity timestamp to fetch only new activities
 - **UI state**: Uses Streamlit session_state to persist DataFrame between interactions
+- **Data persistence**: Each campaign's data is stored separately, switching campaigns preserves data
 
 ## HubSpot Sync Integration
 
 ### Overview
-The app can sync aggregated engagement metrics from the local SQLite database to HubSpot contact custom properties. This enables filtering, reporting, and segmentation based on Lemlist activity data.
+The app can sync data from the local SQLite database to HubSpot contact properties. This enables filtering, reporting, and segmentation based on Lemlist activity data.
 
 ### HubSpot API Setup
 
@@ -308,105 +404,46 @@ The app can sync aggregated engagement metrics from the local SQLite database to
    - Create new app with scope: `crm.objects.contacts.write`
    - Copy the access token
 
-2. **Create Custom Properties** (manual or via API):
-   All properties are prefixed with `lemlist_` and should be created as Contact properties in HubSpot.
+### Synced Properties
 
-### Custom Properties Synced
-
+**Engagement Metrics** (via "Nach HubSpot syncen"):
 | Property Name | Type | Description |
 |---------------|------|-------------|
 | `lemlist_total_activities` | Number | Total count of all activities |
-| `lemlist_first_activity_date` | Date | Date of first activity |
-| `lemlist_last_activity_date` | Date | Date of most recent activity |
-| `lemlist_days_in_campaign` | Number | Days since first activity |
-| `lemlist_current_campaign` | String | Name of the campaign |
-| `lemlist_emails_sent` | Number | Count of emails sent |
-| `lemlist_emails_opened` | Number | Count of emails opened |
-| `lemlist_emails_bounced` | Number | Count of bounced emails |
-| `lemlist_emails_clicked` | Number | Count of clicked emails |
-| `lemlist_emails_replied` | Number | Count of email replies |
-| `lemlist_email_open_rate` | Number | Open rate percentage |
-| `lemlist_last_email_opened_date` | Date | Last email open date |
-| `lemlist_linkedin_visits` | Number | LinkedIn profile visits |
-| `lemlist_linkedin_invites_sent` | Number | LinkedIn invites sent |
-| `lemlist_linkedin_invites_accepted` | Number | LinkedIn invites accepted |
-| `lemlist_linkedin_messages_sent` | Number | LinkedIn messages sent |
-| `lemlist_linkedin_messages_opened` | Number | LinkedIn messages opened |
 | `lemlist_engagement_score` | Number | Calculated engagement score (0-100) |
 | `lemlist_lead_status` | String | Lead status (new, cold, low/medium/high_engagement, bounced) |
+| `lemlist_emails_sent` | Number | Count of emails sent |
+| `lemlist_emails_opened` | Number | Count of emails opened |
+| `lemlist_linkedin_invites_accepted` | Number | LinkedIn invites accepted |
 | `lemlist_last_sync_date` | DateTime | Timestamp of last sync |
 
-### Engagement Score Calculation
+**Job Level** (via "Job Levels syncen"):
+| Property | HubSpot Field | Values |
+|----------|---------------|--------|
+| job_level | `hs_seniority` | owner, director, manager, senior, employee |
 
-The engagement score is calculated using weighted activity types:
+**Department** (via "Departments syncen"):
+| Property | HubSpot Field | Values |
+|----------|---------------|--------|
+| department | `hs_role` | Executive, Finance, Procurement, Engineering, IT, Operations, Production, Marketing, Sales, HR, Legal |
 
-```python
-ENGAGEMENT_WEIGHTS = {
-    'emailsSent': 1,
-    'emailsOpened': 3,
-    'emailsClicked': 4,
-    'emailsReplied': 5,
-    'emailsBounced': -5,
-    'linkedinVisitDone': 2,
-    'linkedinInviteAccepted': 5,
-    'linkedinOpened': 4,
-    'linkedinReplied': 5,
-    'interested': 10,
-    'notInterested': -5,
-    'skipped': -2,
-    # ... more types
-}
-```
+### Important: No Overwriting
 
-Score is capped at 0-100 range.
+All sync functions check if the HubSpot field already has a value:
+- **hs_seniority**: Only written if empty in HubSpot
+- **hs_role**: Only written if empty in HubSpot
+- Existing HubSpot data is NEVER overwritten
+- Skipped contacts are counted and reported
 
-### Lead Status Logic
-
-Status is determined by engagement score and bounces:
-- `bounced`: Has bounced emails
-- `high_engagement`: Score >= 30
-- `medium_engagement`: Score >= 15
-- `low_engagement`: Score >= 5
-- `new`: <= 2 total activities
-- `cold`: Score < 5
-
-### HubSpotClient Class (`hubspot_client.py`)
-
-```python
-class HubSpotClient:
-    def __init__(self, api_token: str)
-    def verify_token() -> bool
-    def update_contact_properties(hubspot_id, properties) -> Dict
-    def batch_update_contacts(updates: List[Dict]) -> Dict
-    def get_contact(hubspot_id) -> Optional[Dict]
-```
-
-**Rate Limits**:
+### Rate Limits
 - Standard: 100 requests/10 seconds
 - Batch API: 4 requests/second (use 0.25s delay between batches)
 - Max 100 contacts per batch
 
-### Sync Function (`app.py`)
-
-**`sync_to_hubspot(campaign_id, hubspot_token, batch_size=50)`**:
-1. Gets all leads with HubSpot IDs from DB
-2. Calculates metrics for each lead using `db.calculate_lead_metrics()`
-3. Batches updates to HubSpot (50 contacts per batch)
-4. Handles errors gracefully (continues on single contact failures)
-5. Returns statistics: processed, success, failed, skipped
-
-### UI Integration
-
-The sidebar includes a "HubSpot Sync" section with:
-- HubSpot API Token input (password field)
-- Info showing number of leads ready for sync
-- "Nach HubSpot syncen" button with progress bar
-- Success/failure statistics after sync
-
 ## HubSpot Notes Analysis
 
 ### Overview
-The app can analyze Lemlist notes stored in HubSpot contacts and identify/remove duplicates. This helps clean up HubSpot from duplicate activity notes created by the Lemlist native integration.
+The app can analyze Lemlist notes stored in HubSpot contacts and identify/remove duplicates.
 
 ### Note Format (from Lemlist native integration)
 ```
@@ -414,87 +451,19 @@ The app can analyze Lemlist notes stored in HubSpot contacts and identify/remove
 Text: {Optional Message Content}
 ```
 
-Examples:
-- `LinkedIn invite sent from campaign My_Campaign - (step 2)`
-- `Email sent from campaign Sales_Outreach - (step 1)`
-
 ### LemlistNoteParser Class (`hubspot_notes_analyzer.py`)
 
-Parses Lemlist notes from HubSpot to extract structured activity data:
-
-```python
-class LemlistNoteParser:
-    ACTIVITY_TYPE_MAP = {
-        'linkedin invite sent': 'linkedinInviteDone',
-        'linkedin profile visited': 'linkedinVisitDone',
-        'linkedin message sent': 'linkedinSent',
-        'email sent': 'emailsSent',
-        'email opened': 'emailsOpened',
-        # ... more mappings
-    }
-
-    def parse_note(note_body: str) -> Optional[Dict]:
-        # Returns: {activity_text, activity_type, campaign, step, message_text, raw_body}
-
-    def is_lemlist_note(note_body: str) -> bool:
-        # Returns True if note matches Lemlist format
-```
+Parses Lemlist notes from HubSpot to extract structured activity data.
 
 ### NotesAnalyzer Class (`hubspot_notes_analyzer.py`)
 
-Analyzes HubSpot notes and compares with DB activities:
-
-```python
-class NotesAnalyzer:
-    def fetch_all_notes(campaign_id, progress_callback) -> List[Dict]:
-        # Fetches all notes for leads in a campaign
-
-    def find_duplicates(notes) -> List[List[Dict]]:
-        # Groups notes by (contact_id, activity_type, campaign, step)
-        # Returns groups with 2+ notes (duplicates)
-
-    def get_duplicate_stats(duplicates) -> Dict:
-        # Returns statistics about duplicates
-
-    def compare_with_db(notes, campaign_id) -> Dict:
-        # Compares HubSpot notes with DB activities
-        # Returns: {matched, in_notes_not_db, in_db_not_notes, stats}
-
-    def delete_duplicates(duplicates, keep_newest=True, progress_callback) -> Dict:
-        # Deletes duplicate notes, keeping newest per group
-        # Returns: {total_to_delete, deleted, failed, failed_ids}
-```
-
-### HubSpot Notes API Methods (`hubspot_client.py`)
-
-```python
-class HubSpotClient:
-    def get_notes_for_contact(contact_id: str) -> List[Dict]:
-        # Fetches all notes associated with a contact (via associations endpoint)
-
-    def get_note(note_id: str) -> Optional[Dict]:
-        # Gets a single note by ID
-
-    def delete_note(note_id: str) -> bool:
-        # Deletes a single note
-
-    def batch_delete_notes(note_ids: List[str]) -> Dict:
-        # Batch deletes up to 100 notes
-```
+- `fetch_all_notes()`: Fetches all notes for leads in a campaign
+- `find_duplicates()`: Groups notes by (contact_id, activity_type, campaign, step)
+- `delete_duplicates()`: Deletes duplicate notes, keeping newest per group
 
 ### UI Integration
 
-The sidebar includes a "HubSpot Notes Analyse" expander with:
-1. **"📥 Notes von HubSpot laden"** button:
-   - Loads all notes for leads in the campaign
-   - Shows progress bar during loading
-   - Counts total notes vs Lemlist notes
-
-2. **Duplicate Analysis**:
-   - Shows number of duplicate groups found
-   - Expandable list showing duplicate details
-   - **"🗑️ Alle Duplikate löschen"** button (keeps newest note per group)
-
-3. **DB Comparison**:
-   - Shows metrics: Matched, Notes Only, DB Only
-   - Expandable lists for discrepancies
+The sidebar includes a "Notes Analyse" section with:
+1. **"📥 Notes laden"** button: Loads notes for analysis
+2. **Duplicate Analysis**: Shows duplicate groups
+3. **"🗑️ Alle Duplikate löschen"** button: Removes duplicates

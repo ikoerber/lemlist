@@ -1,142 +1,70 @@
 """
-HubSpot API Client for syncing Lemlist metrics to HubSpot contacts.
+HubSpot API Client for CRM operations.
 
-Provides batch update functionality for contact properties with
-rate limiting and error handling.
+Provides:
+- Contact property updates (single and batch)
+- Company data retrieval
+- Notes management
+- Cursor-based pagination
 """
 
-import requests
-import time
 import logging
 from typing import Dict, List, Any, Optional
+
+from .base_client import BaseAPIClient, UnauthorizedError, NotFoundError
+from .config import HubSpotConfig
 
 logger = logging.getLogger(__name__)
 
 
-class HubSpotError(Exception):
-    """Base exception for HubSpot API errors"""
-    pass
+class HubSpotClient(BaseAPIClient):
+    """Client for HubSpot CRM API interactions.
 
-
-class HubSpotRateLimitError(HubSpotError):
-    """Raised when HubSpot rate limit is exceeded"""
-    def __init__(self, retry_after: int = 10):
-        self.retry_after = retry_after
-        super().__init__(f"Rate limit exceeded. Retry after {retry_after}s")
-
-
-class HubSpotUnauthorizedError(HubSpotError):
-    """Raised when HubSpot token is invalid"""
-    pass
-
-
-class HubSpotNotFoundError(HubSpotError):
-    """Raised when contact is not found"""
-    pass
-
-
-class HubSpotClient:
-    """Client for HubSpot API interactions.
-
-    Handles contact property updates with rate limiting and error handling.
+    Handles:
+    - Contact and company CRUD operations
+    - Batch updates with rate limiting
+    - Notes management
+    - Association handling
 
     Rate Limits:
     - Standard: 100 requests/10 seconds
     - Batch APIs: 4 requests/second
     """
 
-    BASE_URL = "https://api.hubapi.com"
-
-    # Default timeout for API requests (seconds)
-    DEFAULT_TIMEOUT = 30
-
-    def __init__(self, api_token: str):
+    def __init__(self, config: HubSpotConfig):
         """Initialize HubSpot client.
 
         Args:
-            api_token: HubSpot Private App access token
+            config: HubSpotConfig with API token and settings
         """
-        self.session = requests.Session()
+        super().__init__(config.base_url, config.default_timeout)
+        self.config = config
+
+        # Set authorization header
         self.session.headers.update({
-            'Authorization': f'Bearer {api_token}',
+            'Authorization': f'Bearer {config.api_token}',
             'Content-Type': 'application/json'
         })
 
-    def _make_request(self, method: str, endpoint: str,
-                      max_retries: int = 3, **kwargs) -> requests.Response:
-        """Make HTTP request with retry logic and error handling.
-
-        Args:
-            method: HTTP method (GET, POST, PATCH, etc.)
-            endpoint: API endpoint (without base URL)
-            max_retries: Maximum retry attempts for rate limits
-            **kwargs: Additional arguments for requests
+    def verify_token(self) -> bool:
+        """Verify that the API token is valid.
 
         Returns:
-            Response object
+            True if token is valid, False otherwise
 
         Raises:
-            HubSpotUnauthorizedError: Invalid token
-            HubSpotNotFoundError: Contact not found
-            HubSpotRateLimitError: Rate limit exceeded after retries
-            HubSpotError: Other API errors
+            APIError: For non-auth related errors
         """
-        url = f"{self.BASE_URL}{endpoint}"
+        try:
+            endpoint = "/crm/v3/objects/contacts?limit=1"
+            self._make_request('GET', endpoint)
+            return True
+        except UnauthorizedError:
+            return False
 
-        # Set default timeout if not specified
-        if 'timeout' not in kwargs:
-            kwargs['timeout'] = self.DEFAULT_TIMEOUT
-
-        for attempt in range(max_retries):
-            try:
-                response = self.session.request(method, url, **kwargs)
-
-                # Handle rate limiting
-                if response.status_code == 429:
-                    retry_after = int(response.headers.get('Retry-After', 10))
-                    logger.warning(f"HubSpot rate limit hit. Waiting {retry_after}s...")
-
-                    if attempt < max_retries - 1:
-                        time.sleep(retry_after)
-                        continue
-                    else:
-                        raise HubSpotRateLimitError(retry_after)
-
-                # Handle auth errors
-                if response.status_code == 401:
-                    raise HubSpotUnauthorizedError("Invalid HubSpot API token")
-
-                # Handle not found
-                if response.status_code == 404:
-                    raise HubSpotNotFoundError("Contact not found in HubSpot")
-
-                # Handle other errors
-                if response.status_code >= 400:
-                    error_msg = response.text
-                    try:
-                        error_data = response.json()
-                        error_msg = error_data.get('message', error_msg)
-                    except Exception:
-                        pass
-                    raise HubSpotError(f"HubSpot API error ({response.status_code}): {error_msg}")
-
-                return response
-
-            except requests.exceptions.Timeout:
-                logger.warning(f"HubSpot request timeout (attempt {attempt + 1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
-                    continue
-                raise HubSpotError("Request timeout after retries")
-
-            except requests.exceptions.RequestException as e:
-                logger.error(f"HubSpot request error: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-                raise HubSpotError(f"Request failed: {e}")
-
-        raise HubSpotError("Max retries exceeded")
+    # =========================================================================
+    # Contact Operations
+    # =========================================================================
 
     def update_contact_properties(self, hubspot_id: str,
                                    properties: Dict[str, Any]) -> Dict:
@@ -151,18 +79,17 @@ class HubSpotClient:
 
         Example:
             client.update_contact_properties("12345", {
-                "lemlist_total_activities": 15,
-                "lemlist_engagement_score": 42
+                "firstname": "John",
+                "company": "Acme Inc"
             })
         """
         endpoint = f"/crm/v3/objects/contacts/{hubspot_id}"
-
         response = self._make_request(
             'PATCH',
             endpoint,
-            json={"properties": properties}
+            json={"properties": properties},
+            max_retries=self.config.max_retries
         )
-
         return response.json()
 
     def batch_update_contacts(self, updates: List[Dict]) -> Dict:
@@ -179,17 +106,17 @@ class HubSpotClient:
             client.batch_update_contacts([
                 {
                     "id": "12345",
-                    "properties": {"lemlist_total_activities": 15}
+                    "properties": {"company": "Acme Inc"}
                 },
                 {
                     "id": "67890",
-                    "properties": {"lemlist_total_activities": 8}
+                    "properties": {"company": "Tech Corp"}
                 }
             ])
 
         Note:
             Rate limit for batch API: 4 requests/second
-            Use 0.25s delay between batch calls
+            Use config.batch_delay between batch calls
         """
         if not updates:
             return {"results": [], "errors": []}
@@ -198,17 +125,16 @@ class HubSpotClient:
             raise ValueError("Maximum 100 contacts per batch")
 
         endpoint = "/crm/v3/objects/contacts/batch/update"
-
         response = self._make_request(
             'POST',
             endpoint,
-            json={"inputs": updates}
+            json={"inputs": updates},
+            max_retries=self.config.max_retries
         )
-
         return response.json()
 
     def get_contact(self, hubspot_id: str) -> Optional[Dict]:
-        """Get contact by ID (for verification).
+        """Get contact by ID.
 
         Args:
             hubspot_id: HubSpot contact ID
@@ -220,32 +146,14 @@ class HubSpotClient:
             endpoint = f"/crm/v3/objects/contacts/{hubspot_id}"
             response = self._make_request('GET', endpoint)
             return response.json()
-        except HubSpotNotFoundError:
+        except NotFoundError:
             return None
-
-    def verify_token(self) -> bool:
-        """Verify that the API token is valid.
-
-        Returns:
-            True if token is valid, False otherwise
-
-        Raises:
-            HubSpotError: For non-auth related errors (network, rate limit, etc.)
-        """
-        try:
-            # Simple API call to verify auth
-            endpoint = "/crm/v3/objects/contacts?limit=1"
-            self._make_request('GET', endpoint)
-            return True
-        except HubSpotUnauthorizedError:
-            return False
-        # Let other errors propagate - they indicate issues that should be handled
 
     def get_all_contacts(self, properties: List[str], limit: int = 100) -> List[Dict]:
         """Fetch all contacts with specified properties using cursor-based pagination.
 
         Args:
-            properties: List of property names to fetch (e.g., ['jobtitle', 'hs_seniority'])
+            properties: List of property names to fetch
             limit: Number of contacts per page (max 100)
 
         Returns:
@@ -258,8 +166,6 @@ class HubSpotClient:
         """
         all_contacts = []
         after = None
-
-        # Build properties query string
         properties_param = ','.join(properties)
 
         while True:
@@ -273,7 +179,7 @@ class HubSpotClient:
             contacts = data.get('results', [])
             all_contacts.extend(contacts)
 
-            # Check for next page (cursor-based pagination)
+            # Check for next page
             paging = data.get('paging', {})
             if paging.get('next', {}).get('after'):
                 after = paging['next']['after']
@@ -291,20 +197,15 @@ class HubSpotClient:
             limit: Number of contacts per page (max 100)
 
         Returns:
-            List of contact dicts with 'id', 'properties', and 'associations' keys.
-            The 'associations' dict contains 'companies' with list of associated company IDs.
+            List of contact dicts with 'id', 'properties', and 'associations' keys
 
         Example:
-            contacts = client.get_all_contacts_with_companies(['industry_fit'])
+            contacts = client.get_all_contacts_with_companies(['email', 'company'])
             for contact in contacts:
                 companies = contact.get('associations', {}).get('companies', {}).get('results', [])
-                for assoc in companies:
-                    print(f"Contact {contact['id']} → Company {assoc['id']}")
         """
         all_contacts = []
         after = None
-
-        # Build properties query string
         properties_param = ','.join(contact_properties)
 
         while True:
@@ -318,7 +219,7 @@ class HubSpotClient:
             contacts = data.get('results', [])
             all_contacts.extend(contacts)
 
-            # Check for next page (cursor-based pagination)
+            # Check for next page
             paging = data.get('paging', {})
             if paging.get('next', {}).get('after'):
                 after = paging['next']['after']
@@ -326,6 +227,10 @@ class HubSpotClient:
                 break
 
         return all_contacts
+
+    # =========================================================================
+    # Company Operations
+    # =========================================================================
 
     def batch_get_companies(self, company_ids: List[str],
                             properties: List[str]) -> Dict[str, Dict]:
@@ -336,7 +241,7 @@ class HubSpotClient:
             properties: List of property names to fetch (e.g., ['industry', 'name'])
 
         Returns:
-            Dict mapping company_id to company data: {id: {properties: {...}}}
+            Dict mapping company_id to company data
 
         Example:
             companies = client.batch_get_companies(['123', '456'], ['industry'])
@@ -367,7 +272,7 @@ class HubSpotClient:
         return result
 
     # =========================================================================
-    # Notes API Methods
+    # Notes Operations
     # =========================================================================
 
     def get_notes_for_contact(self, contact_id: str) -> List[Dict]:
@@ -377,17 +282,15 @@ class HubSpotClient:
             contact_id: HubSpot contact ID
 
         Returns:
-            List of note objects with properties and associations
+            List of note objects with properties
 
         Note:
-            Uses the associations endpoint to get notes linked to a contact.
-            Handles pagination automatically.
+            Uses the associations endpoint. Handles pagination automatically.
         """
         all_notes = []
         after = None
 
         while True:
-            # First get the note IDs associated with this contact
             endpoint = f"/crm/v4/objects/contacts/{contact_id}/associations/notes"
             params = {"limit": 100}
             if after:
@@ -396,8 +299,7 @@ class HubSpotClient:
             try:
                 response = self._make_request('GET', endpoint, params=params)
                 data = response.json()
-            except HubSpotNotFoundError:
-                # Contact has no notes
+            except NotFoundError:
                 return []
 
             note_ids = [r['toObjectId'] for r in data.get('results', [])]
@@ -405,7 +307,7 @@ class HubSpotClient:
             if not note_ids:
                 break
 
-            # Now fetch the actual note details
+            # Fetch actual note details
             for note_id in note_ids:
                 note = self.get_note(note_id)
                 if note:
@@ -435,7 +337,7 @@ class HubSpotClient:
             params = {"properties": "hs_note_body,hs_timestamp,hs_createdate"}
             response = self._make_request('GET', endpoint, params=params)
             return response.json()
-        except HubSpotNotFoundError:
+        except NotFoundError:
             return None
 
     def delete_note(self, note_id: str) -> bool:

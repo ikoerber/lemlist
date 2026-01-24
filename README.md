@@ -10,6 +10,8 @@ Eine robuste Streamlit-App zum Extrahieren und Analysieren von Leads und Activit
 - **Incremental Updates**: Lädt nur neue Activities seit letztem Sync
 - **HubSpot Integration**: Automatisches Fetching von HubSpot IDs mit klickbaren Links
 - **HubSpot Sync**: Engagement-Metriken zu HubSpot Custom Properties synchronisieren
+- **Job Level Sync**: Automatische Klassifizierung und Sync zu HubSpot hs_seniority
+- **Department Sync**: Automatische Klassifizierung und Sync zu HubSpot hs_role
 - **HubSpot Notes Analyse**: Lemlist Notes in HubSpot analysieren und Duplikate bereinigen
 - **LinkedIn URLs**: Klickbare LinkedIn Profile direkt in der Tabelle
 - **Lead-spezifische Ansicht**: Wähle einen einzelnen Lead um dessen Activity Timeline zu sehen
@@ -54,6 +56,8 @@ Dann bearbeite die `.env` Datei und füge deine Werte ein:
 ```bash
 LEMLIST_API_KEY=dein_api_key_hier
 CAMPAIGN_ID=deine_campaign_id_hier
+HUBSPOT_API_TOKEN=dein_hubspot_token_hier
+HUBSPOT_ACCOUNT_ID=deine_account_id_hier
 ```
 
 **Vorteile**:
@@ -138,7 +142,28 @@ Die App erstellt eine "Flat Table" mit folgenden Spalten:
 
 ## Architektur
 
-### LemlistClient (`app.py`)
+### Projektstruktur
+
+```
+lemlist/
+├── app.py                    # Hauptapplikation (Streamlit UI, Sync-Funktionen)
+├── db.py                     # Datenbank-Layer (LemlistDB, SQLite)
+├── hubspot_notes_analyzer.py # HubSpot Notes Parser & Duplikat-Erkennung
+├── api_clients/              # Wiederverwendbare API Clients
+│   ├── __init__.py           # Package exports
+│   ├── base_client.py        # BaseAPIClient (Retry, Rate Limits)
+│   ├── config.py             # Config Dataclasses
+│   ├── hubspot.py            # HubSpotClient
+│   ├── lemlist.py            # LemlistClient
+│   └── streamlit_wrappers.py # Streamlit UI Integration
+├── requirements.txt          # Python Dependencies
+├── .env.example              # Template für API Config
+├── .gitignore                # Git ignore rules
+├── CLAUDE.md                 # Claude Code Instruktionen
+└── README.md                 # Diese Datei
+```
+
+### LemlistClient (`api_clients/lemlist.py`)
 - Zentraler API Client mit Session-Management
 - Rate Limit Handling und Retry Logic
 - Automatische Pagination für Activities und Campaigns
@@ -146,24 +171,35 @@ Die App erstellt eine "Flat Table" mit folgenden Spalten:
 - `get_lead_details()`: Holt HubSpot IDs für einzelne Leads
 - `get_all_campaigns()`: Lädt Campaign-Liste für Dropdown
 
+### HubSpotClient (`api_clients/hubspot.py`)
+- HubSpot CRM API Client
+- `verify_token()`: Token-Validierung
+- `batch_update_contacts()`: Batch-Updates für bis zu 100 Kontakte
+- `get_notes_for_contact()`: Notes für Analyse laden
+- `batch_delete_notes()`: Duplikate löschen
+
 ### LemlistDB (`db.py`)
 - SQLite Datenbank-Layer für lokales Caching
 - Tabellen: `campaigns`, `leads`, `activities`
 - `upsert_*()` Methoden für idempotente Speicherung
 - `get_activities_by_campaign()`: LEFT JOIN von Activities mit Lead-Daten
+- `get_leads_with_job_level()`: Leads für Job Level Sync
+- `get_leads_with_department()`: Leads für Department Sync
 - Incremental Updates durch Timestamp-Tracking
 
 ### Data Flow
-1. **First Load**: Activities von API → Leads extrahieren → HubSpot IDs fetchen (erste 50) → DB speichern
+1. **First Load**: Activities von API → Leads extrahieren → job_level/department berechnen → HubSpot IDs fetchen (erste 50) → DB speichern
 2. **Incremental Update**: Neue Activities seit letztem Sync → Neue Leads extrahieren → HubSpot IDs fetchen → DB updaten
 3. **Display**: Daten aus DB laden (JOIN) → Streamlit DataFrame → Filter anwenden → Anzeigen/Exportieren
 
 ### Buttons & Actions
 - **🔄 Aktivitäten aktualisieren**: Lädt nur neue Activities (schnell)
 - **🔁 Vollständig neu laden**: Löscht DB und lädt alles neu (bei Problemen)
-- **⬇️ Alle Lead Details laden**: Fetcht HubSpot IDs für ALLE Leads automatisch (mit Progress Bar, Pause alle 50 Leads)
-- **⬆️ Nach HubSpot syncen**: Synchronisiert Engagement-Metriken zu HubSpot Custom Properties
-- **📥 Notes von HubSpot laden**: Lädt Lemlist Notes für Analyse und Duplikat-Erkennung
+- **⬇️ Alle Lead Details laden**: Fetcht HubSpot IDs für ALLE Leads automatisch
+- **⬆️ Nach HubSpot syncen**: Synchronisiert Engagement-Metriken zu HubSpot
+- **🎯 Job Levels syncen**: Synchronisiert job_level zu HubSpot hs_seniority
+- **🏢 Departments syncen**: Synchronisiert department zu HubSpot hs_role
+- **📥 Notes laden**: Lädt Lemlist Notes für Analyse und Duplikat-Erkennung
 - **🗑️ Datenbank leeren**: Löscht alle Campaign-Daten aus DB
 
 ## Fehlerbehandlung
@@ -196,36 +232,9 @@ Die App behandelt folgende Error-Szenarien:
 - Zweite Ladung sollte < 1 Sekunde sein (Cache)
 - Lösche Cache wenn Daten aktualisiert werden sollen
 
-## Development
-
-### Projektstruktur
-
-```
-lemlist/
-├── app.py                    # Hauptapplikation (Streamlit UI, LemlistClient)
-├── db.py                     # Datenbank-Layer (LemlistDB, SQLite)
-├── hubspot_client.py         # HubSpot API Client (Kontakte & Notes)
-├── hubspot_notes_analyzer.py # HubSpot Notes Parser & Duplikat-Erkennung
-├── requirements.txt          # Python Dependencies
-├── .env.example              # Template für API Config
-├── .gitignore               # Git ignore rules
-├── CLAUDE.md                # Claude Code Instruktionen
-└── README.md                # Diese Datei
-```
-
-### Testing
-
-Manuelle Tests:
-```bash
-# Mit kleiner Testkampagne starten
-streamlit run app.py
-
-# Verschiedene Szenarien testen:
-# - Valide Daten
-# - Invalider API Key
-# - Invalide Campaign ID
-# - Cache-Funktionalität
-```
+### HubSpot Links leer
+- Stelle sicher, dass `HUBSPOT_ACCOUNT_ID` in der `.env` Datei gesetzt ist
+- Format: `HUBSPOT_ACCOUNT_ID=12345678`
 
 ## HubSpot Integration
 
@@ -243,6 +252,40 @@ Die App kann aggregierte Engagement-Metriken aus der lokalen SQLite Datenbank zu
 - `lemlist_engagement_score`: Berechneter Engagement Score (0-100)
 - `lemlist_lead_status`: Lead Status (new, cold, low/medium/high_engagement, bounced)
 - Und viele weitere (siehe CLAUDE.md für vollständige Liste)
+
+### Job Level Sync
+
+Automatische Klassifizierung von Job Titles zu HubSpot hs_seniority:
+
+| Job Level | HubSpot hs_seniority | Beispiele |
+|-----------|---------------------|-----------|
+| owner | owner | CEO, CTO, CFO, Geschäftsführer, Vorstand |
+| director | director | Director, VP, Head of, Leiter |
+| manager | manager | Manager, Teamleiter, Supervisor |
+| senior | senior | Senior, Principal, Expert |
+| employee | employee | (Standard-Fallback) |
+
+**Wichtig**: Bestehende hs_seniority Werte in HubSpot werden NICHT überschrieben.
+
+### Department Sync
+
+Automatische Klassifizierung von Job Titles zu HubSpot hs_role:
+
+| Department | HubSpot hs_role | Beispiele |
+|------------|-----------------|-----------|
+| Executive | Executive | CEO, CTO, Geschäftsführer |
+| Finance | FINANCE | Finance Manager, Controller |
+| Procurement | Procurement | Einkäufer, Purchasing |
+| Engineering | Engineering | Software Engineer, Entwickler |
+| IT | IT | IT Manager, System Admin, Digital |
+| Operations | Operations | Operations, Logistik, Assistenz |
+| Production | Production | Produktion, Manufacturing |
+| Marketing | Marketing | Marketing Manager, Content, SEO |
+| Sales | Sales | Sales, Vertrieb, E-Commerce |
+| HR | HR | HR Manager, Personal, Recruiting |
+| Legal | Legal | Legal, Compliance, Datenschutz |
+
+**Wichtig**: Bestehende hs_role Werte in HubSpot werden NICHT überschrieben.
 
 ### HubSpot Notes Analyse
 
@@ -267,12 +310,12 @@ Die folgenden Activity Types werden automatisch herausgefiltert (nicht nützlich
 
 Dies behebt das Problem, dass Email-Clients den Tracking-Pixel mehrfach laden (z.B. bei Preview-Pane).
 
-## Zukünftige Erweiterungen
+## Datenpersistenz
 
-- **Webhook Integration**: Real-time Activity Updates statt Polling
-- **Multi-Campaign Support**: Mehrere Kampagnen gleichzeitig analysieren
-- **Data Visualization**: Charts für Activity Types und Zeitverläufe
-- **Export Formats**: Excel und JSON zusätzlich zu CSV
+- Jede Campaign wird separat in der SQLite Datenbank gespeichert
+- Beim Wechsel zwischen Campaigns bleiben alle Daten erhalten
+- Nur "Vollständig neu laden" löscht die Daten der aktuellen Campaign
+- Daten anderer Campaigns werden nie gelöscht
 
 ## Lizenz
 

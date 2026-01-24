@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import requests
 import re
 from datetime import datetime
 import time
@@ -8,11 +7,18 @@ import os
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
 from db import LemlistDB
-from hubspot_client import (
-    HubSpotClient, HubSpotError, HubSpotUnauthorizedError,
-    HubSpotRateLimitError, HubSpotNotFoundError
+from api_clients import HubSpotConfig, LemlistConfig
+from api_clients.streamlit_wrappers import StreamlitHubSpotClient, StreamlitLemlistClient
+from api_clients.base_client import (
+    APIError, UnauthorizedError, NotFoundError, RateLimitError
 )
-from hubspot_notes_analyzer import NotesAnalyzer, LemlistNoteParser
+from hubspot_notes_analyzer import NotesAnalyzer
+
+# Backwards compatibility aliases for HubSpot errors
+HubSpotError = APIError
+HubSpotUnauthorizedError = UnauthorizedError
+HubSpotNotFoundError = NotFoundError
+HubSpotRateLimitError = RateLimitError
 import logging
 
 # Configure logging
@@ -98,6 +104,118 @@ _JOB_LEVEL_PATTERNS = {
     level: [re.compile(pattern, re.IGNORECASE) for pattern in patterns]
     for level, patterns in JOB_LEVEL_KEYWORDS.items()
 }
+
+# Department to HubSpot hs_role mapping
+DEPARTMENT_TO_HUBSPOT_ROLE = {
+    'Finance': 'FINANCE',
+    'Procurement': 'Procurement',
+    'Engineering': 'Engineering',
+    'IT': 'IT',
+    'Executive': 'Executive',
+    'Operations': 'Operations',
+    'Production': 'Production',
+    'Marketing': 'Marketing',
+    'Sales': 'Sales',
+    'HR': 'HR',
+    'Legal': 'Legal',
+}
+
+# Department Keywords for classification from job_title
+# Order matters: more specific patterns should come first
+DEPARTMENT_KEYWORDS = {
+    'Executive': [
+        r'\bceo\b', r'\bcto\b', r'\bcfo\b', r'\bcmo\b', r'\bcoo\b', r'\bcio\b', r'\bcpo\b', r'\bcro\b',
+        r'\bchief\b', r'\bpresident\b', r'\bgeschäftsführer\b', r'\bvorstand\b',
+        r'\bmanaging director\b', r'\bgeneral manager\b', r'\bgf\b',
+    ],
+    'Finance': [
+        r'\bfinance\b', r'\bfinanz\b', r'\baccounting\b', r'\bbuchhaltung\b',
+        r'\bcontroller\b', r'\bcontrolling\b', r'\btreasur', r'\baudit',
+        r'\bfinanzbuchhalt', r'\brechnungswesen\b',
+    ],
+    'Procurement': [
+        r'\bprocurement\b', r'\beinkauf\b', r'\bpurchasing\b', r'\bsourcing\b',
+        r'\bbuyer\b', r'\bkäufer\b', r'\bsupply\s*chain\b', r'\blieferant',
+        r'\bvendor\b', r'\bbeschaffung\b',
+    ],
+    'Engineering': [
+        r'\bengineer', r'\bingenieur', r'\bdevelop', r'\bentwickl',
+        r'\barchitect\b', r'\bsoftware\b', r'\bhardware\b', r'\bfirmware\b',
+        r'\bprogramm', r'\bcoding\b', r'\btech\s*lead\b',
+    ],
+    'IT': [
+        r'\b(?<!market)it\b', r'\binformation\s*tech', r'\bsystem\s*admin',
+        r'\bnetwork\b', r'\bnetzwerk\b', r'\binfrastruc', r'\bdevops\b',
+        r'\bcloud\b', r'\bsecurity\b', r'\bcyber\b', r'\bdata\s*center\b',
+        r'\bsap\b', r'\berp\b', r'\bcrm\b', r'\bhelpdesk\b', r'\bsupport\b',
+        r'\bdigital\b',
+    ],
+    'Operations': [
+        r'\boperation', r'\bproject\s*manag', r'\bprojektmanag',
+        r'\bprocess\b', r'\bprozess\b', r'\bquality\b', r'\bqualität\b',
+        r'\bqa\b', r'\bqm\b', r'\blogist', r'\bwarehouse\b', r'\blager\b',
+        r'\bassistenz\b', r'\bassistent', r'\bassistant\b',
+    ],
+    'Production': [
+        r'\bproduction\b', r'\bproduktion\b', r'\bmanufactur', r'\bfertigung\b',
+        r'\bplant\b', r'\bwerk\b', r'\bassembly\b', r'\bmontage\b',
+        r'\bmaintenance\b', r'\binstandhaltung\b', r'\bmaschinen\b',
+    ],
+    'Marketing': [
+        r'\w*marketing\w*', r'\bbrand\b', r'\bmarke\b', r'\bcommunication',
+        r'\bkommunikation\b', r'\bcontent\b', r'\bsocial\s*media\b',
+        r'\bpr\b', r'\bpublic\s*relation', r'\bevent\b',
+        r'\bseo\b', r'\bsem\b', r'\bcampaign\b', r'\bkampagne\b',
+    ],
+    'Sales': [
+        r'\bsales\b', r'\bvertrieb\b', r'\baccount\b', r'\bbusiness\s*develop',
+        r'\bgeschäftsentwick', r'\bkundenbet', r'\bcustomer\s*success\b',
+        r'\bkey\s*account\b', r'\bcommercial\b', r'\bhandel\b',
+        r'\bauß?endienst\b', r'\binnendienst\b',
+        r'\be-?commerce\b', r'\bcommerce\b',
+    ],
+    'HR': [
+        r'\bhuman\s*resource', r'\bhr\b', r'\bpersonal\b', r'\brecruit',
+        r'\btalent\b', r'\bpeople\b', r'\bpayroll\b', r'\blohn\b',
+        r'\btraining\b', r'\bschul', r'\borganisation\s*develop',
+    ],
+    'Legal': [
+        r'\blegal\b', r'\brecht\b', r'\bjurist', r'\blawyer\b', r'\battorney\b',
+        r'\bcompliance\b', r'\bcontract\b', r'\bvertrag\b', r'\bdatenschutz\b',
+        r'\bprivacy\b', r'\bgdpr\b', r'\bdsgvo\b',
+    ],
+}
+
+# Pre-compile department regex patterns
+_DEPARTMENT_PATTERNS = {
+    dept: [re.compile(pattern, re.IGNORECASE) for pattern in patterns]
+    for dept, patterns in DEPARTMENT_KEYWORDS.items()
+}
+
+
+def calculate_department(job_title: Optional[str]) -> Optional[str]:
+    """Calculate department from job title using keyword matching.
+
+    Maps job titles to departments:
+    - Executive, Finance, Procurement, Engineering, IT
+    - Operations, Production, Marketing, Sales, HR, Legal
+
+    Args:
+        job_title: The job title to classify
+
+    Returns:
+        Department string or None if no match found
+    """
+    if not job_title:
+        return None
+
+    # Check each department's patterns
+    for department, patterns in _DEPARTMENT_PATTERNS.items():
+        for pattern in patterns:
+            if pattern.search(job_title):
+                return department
+
+    return None
 
 
 def calculate_job_level(job_title: Optional[str]) -> str:
@@ -188,115 +306,26 @@ ACTIVITY_TYPE_MAP = {
 # ============================================================================
 # Custom Exceptions
 # ============================================================================
-class UnauthorizedError(Exception):
-    pass
+# Lemlist API Client (moved to api_clients package)
+# Using StreamlitLemlistClient from api_clients.streamlit_wrappers
+# ============================================================================
 
-
-class NotFoundError(Exception):
-    pass
-
-
-class RateLimitError(Exception):
-    def __init__(self, message, retry_after=None):
-        super().__init__(message)
-        self.retry_after = retry_after
-
-
-# Lemlist API Client
+# Wrapper class for backwards compatibility
+# Uses StreamlitLemlistClient internally with filtering/deduplication
 class LemlistClient:
+    """Backwards compatible wrapper around StreamlitLemlistClient.
+
+    Provides same interface as old LemlistClient but uses new modular implementation.
+    """
+
     def __init__(self, api_key: str):
-        self.base_url = "https://api.lemlist.com/api"
-        self.session = requests.Session()
-        # Basic Auth: empty username, API key as password (format: ":YourApiKey")
-        self.session.auth = ('', api_key)
-        self.session.headers.update({
-            'User-Agent': 'Lemlist-Streamlit-App/1.0'
-        })
+        """Initialize Lemlist client.
 
-    def _make_request(self, endpoint: str, params: Optional[Dict] = None, max_retries: int = 3) -> requests.Response:
-        """Make HTTP request with rate limit handling and retry logic"""
-        url = f"{self.base_url}{endpoint}"
-
-        for attempt in range(max_retries):
-            try:
-                response = self.session.get(url, params=params, timeout=30)
-
-                # Check rate limit headers
-                rate_limit_remaining = response.headers.get('X-RateLimit-Remaining')
-                if rate_limit_remaining and int(rate_limit_remaining) < 5:
-                    reset_time = response.headers.get('X-RateLimit-Reset')
-                    if reset_time:
-                        wait_time = max(0, int(reset_time) - time.time())
-                        if wait_time > 0:
-                            st.warning(f"⏳ Rate limit niedrig. Warte {wait_time}s...")
-                            time.sleep(wait_time)
-
-                # Handle HTTP errors
-                if response.status_code == 401:
-                    raise UnauthorizedError("Ungültiger API Key")
-                elif response.status_code == 404:
-                    raise NotFoundError("Ressource nicht gefunden")
-                elif response.status_code == 429:
-                    retry_after = int(response.headers.get('Retry-After', 2 ** attempt))
-                    if attempt < max_retries - 1:
-                        st.warning(f"⏳ Rate limit erreicht. Retry in {retry_after}s... (Versuch {attempt + 1}/{max_retries})")
-                        time.sleep(retry_after)
-                        continue
-                    else:
-                        raise RateLimitError("Rate limit erreicht", retry_after)
-
-                response.raise_for_status()
-                return response
-
-            except requests.exceptions.Timeout:
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
-                    st.warning(f"⏳ Timeout. Retry in {wait_time}s... (Versuch {attempt + 1}/{max_retries})")
-                    time.sleep(wait_time)
-                else:
-                    raise
-            except requests.exceptions.RequestException as e:
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
-                    st.warning(f"⏳ Netzwerkfehler. Retry in {wait_time}s... (Versuch {attempt + 1}/{max_retries})")
-                    time.sleep(wait_time)
-                else:
-                    raise
-
-        raise Exception("Max retries erreicht")
-
-    def _parse_json_response(self, response: requests.Response, endpoint: str) -> List[Dict]:
-        """Safely parse JSON response with error handling"""
-        try:
-            # Check if response is empty
-            if not response.content:
-                return []
-
-            # Try to parse JSON
-            data = response.json()
-
-            # Ensure we return a list
-            if isinstance(data, list):
-                return data
-            elif isinstance(data, dict):
-                # Some endpoints might return a dict with a data field
-                return [data]
-            else:
-                st.error(f"❌ Unerwartete Response-Format von {endpoint}: {type(data)}")
-                return []
-
-        except requests.exceptions.JSONDecodeError as e:
-            # Debug info
-            st.error(f"❌ Fehler beim Parsen der JSON Response von {endpoint}")
-            st.error(f"Status Code: {response.status_code}")
-            st.error(f"Content-Type: {response.headers.get('Content-Type', 'unknown')}")
-
-            # Show first 500 chars of response for debugging
-            content_preview = response.text[:500] if response.text else "(leer)"
-            with st.expander("🔍 Response Details (für Debugging)"):
-                st.code(content_preview)
-
-            raise Exception(f"Ungültige JSON Response von {endpoint}: {str(e)}")
+        Args:
+            api_key: Lemlist API key
+        """
+        config = LemlistConfig(api_key=api_key)
+        self._client = StreamlitLemlistClient(config)
 
     def get_all_activities(self, campaign_id: str) -> List[Dict]:
         """Fetch all activities for a campaign with pagination.
@@ -304,37 +333,23 @@ class LemlistClient:
         Automatically:
         - Filters out activity types defined in FILTERED_ACTIVITY_TYPES
         - Deduplicates emailsOpened (keeps first per lead/template/step)
+
+        Args:
+            campaign_id: Campaign ID
+
+        Returns:
+            List of filtered and deduplicated activities
         """
-        all_activities = []
-        offset = 0
-        limit = 100
+        all_activities = self._client.get_all_activities(campaign_id)
 
-        while True:
-            params = {'campaignId': campaign_id, 'limit': limit, 'offset': offset}
-            response = self._make_request("/activities", params)
+        # Filter out unwanted activity types
+        filtered = [a for a in all_activities if a.get('type') not in FILTERED_ACTIVITY_TYPES]
 
-            activities = self._parse_json_response(response, "/activities")
-            if not activities or len(activities) == 0:
-                break
-
-            # Filter out unwanted activity types before adding to results
-            filtered = [a for a in activities if a.get('type') not in FILTERED_ACTIVITY_TYPES]
-            all_activities.extend(filtered)
-
-            # If we got fewer results than limit, we've reached the end
-            if len(activities) < limit:
-                break
-
-            offset += limit
-
-            # Small delay to respect rate limits
-            time.sleep(API_PAGINATION_DELAY)
-
-        # Deduplicate activities (e.g., multiple emailsOpened from same email)
-        return deduplicate_activities(all_activities)
+        # Deduplicate activities
+        return deduplicate_activities(filtered)
 
     def get_lead_details(self, email: str) -> Dict:
-        """Fetch detailed information for a specific lead by email
+        """Fetch detailed information for a specific lead by email.
 
         Args:
             email: Lead email address
@@ -342,17 +357,10 @@ class LemlistClient:
         Returns:
             Dict with lead details including hubspotLeadId
         """
-        response = self._make_request(f"/leads/{email}")
-        leads = self._parse_json_response(response, f"/leads/{email}")
-
-        # API returns a list with a single lead
-        if leads and len(leads) > 0:
-            return leads[0]
-        else:
-            return {}
+        return self._client.get_lead_details(email)
 
     def get_all_campaigns(self, status: Optional[str] = None) -> List[Dict]:
-        """Fetch all campaigns with pagination
+        """Fetch all campaigns with pagination.
 
         Args:
             status: Filter by status ('running', 'draft', 'archived', 'ended', 'paused', 'errors')
@@ -360,33 +368,7 @@ class LemlistClient:
         Returns:
             List of campaign dictionaries with _id, name, status, etc.
         """
-        all_campaigns = []
-        offset = 0
-        limit = 100
-
-        while True:
-            params = {'limit': limit, 'offset': offset}
-            if status:
-                params['status'] = status
-
-            response = self._make_request("/campaigns", params)
-
-            campaigns = self._parse_json_response(response, "/campaigns")
-            if not campaigns or len(campaigns) == 0:
-                break
-
-            all_campaigns.extend(campaigns)
-
-            # If we got fewer results than limit, we've reached the end
-            if len(campaigns) < limit:
-                break
-
-            offset += limit
-
-            # Small delay to respect rate limits
-            time.sleep(API_PAGINATION_DELAY)
-
-        return all_campaigns
+        return self._client.get_all_campaigns(status=status)
 
 
 # ============================================================================
@@ -426,6 +408,7 @@ def extract_leads_from_activities(activities: List[Dict]) -> List[Dict]:
                 'companyName': activity.get('leadCompanyName') or activity.get('companyName'),
                 'jobTitle': job_title,
                 'job_level': calculate_job_level(job_title),
+                'department': calculate_department(job_title),
                 'phone': activity.get('leadPhone') or activity.get('phone'),
                 'location': activity.get('location'),
             }
@@ -787,15 +770,17 @@ def fetch_all_lead_details(api_key: str, campaign_id: str,
             company_name = (lead_details.get('companyName') or
                           lead_details.get('company') or
                           None)
-            department = (lead_details.get('department') or
-                         lead_details.get('departments') or
-                         None)
+            department_from_api = (lead_details.get('department') or
+                                   lead_details.get('departments') or
+                                   None)
             job_title = (lead_details.get('jobTitle') or
                         lead_details.get('position') or
                         None)
 
-            # Calculate job level from job title
+            # Calculate job level and department from job title
             job_level = calculate_job_level(job_title) if job_title else None
+            # Use API department if available, otherwise calculate from job_title
+            department = department_from_api or calculate_department(job_title)
 
             # Update DB using lead_id as identifier
             db.update_lead_details(
@@ -835,6 +820,23 @@ def fetch_all_lead_details(api_key: str, campaign_id: str,
     }
 
 
+def _create_hubspot_client(api_token: str) -> StreamlitHubSpotClient:
+    """Create HubSpot client with config.
+
+    Args:
+        api_token: HubSpot API token
+
+    Returns:
+        Configured StreamlitHubSpotClient instance
+    """
+    config = HubSpotConfig(
+        api_token=api_token,
+        batch_size=HUBSPOT_BATCH_SIZE,
+        batch_delay=HUBSPOT_BATCH_DELAY
+    )
+    return StreamlitHubSpotClient(config)
+
+
 def sync_to_hubspot(campaign_id: str, hubspot_token: str,
                     batch_size: Optional[int] = None,
                     progress_callback=None) -> Dict[str, int]:
@@ -856,7 +858,7 @@ def sync_to_hubspot(campaign_id: str, hubspot_token: str,
         batch_size = HUBSPOT_BATCH_SIZE
 
     db = LemlistDB()
-    hubspot = HubSpotClient(hubspot_token)
+    hubspot = _create_hubspot_client(hubspot_token)
 
     # Get all leads with HubSpot IDs
     leads = db.get_all_leads_with_hubspot_ids(campaign_id)
@@ -936,17 +938,17 @@ def sync_to_hubspot(campaign_id: str, hubspot_token: str,
 
 
 def sync_job_levels_to_hubspot(hubspot_token: str,
+                                campaign_id: Optional[str] = None,
                                 batch_size: Optional[int] = None,
                                 progress_callback=None) -> Dict[str, int]:
-    """Sync job levels to ALL HubSpot contacts based on their job title.
+    """Sync job levels from Lemlist leads to HubSpot hs_seniority property.
 
-    Reads all HubSpot contacts with jobtitle, calculates job_level using
-    calculate_job_level(), and updates the hs_seniority property.
-
-    Only updates contacts that have a jobtitle but no hs_seniority set.
+    Uses job_level from local database (calculated from Lemlist job_title).
+    Only updates contacts that don't have hs_seniority set yet.
 
     Args:
         hubspot_token: HubSpot Private App access token
+        campaign_id: Optional campaign ID to filter leads (None = all campaigns)
         batch_size: Number of contacts per batch (max 100, default HUBSPOT_BATCH_SIZE)
         progress_callback: Optional callback function(current, total) for progress updates
 
@@ -956,37 +958,67 @@ def sync_job_levels_to_hubspot(hubspot_token: str,
     if batch_size is None:
         batch_size = HUBSPOT_BATCH_SIZE
 
-    hubspot = HubSpotClient(hubspot_token)
+    db = LemlistDB()
+    hubspot = _create_hubspot_client(hubspot_token)
 
-    # Fetch all contacts with jobtitle and hs_seniority
-    logger.info("Fetching all HubSpot contacts with jobtitle and hs_seniority...")
-    all_contacts = hubspot.get_all_contacts(['jobtitle', 'hs_seniority'])
+    # Get leads from local DB with hubspot_id and job_level
+    logger.info("Loading leads from local database...")
+    leads = db.get_leads_with_job_level(campaign_id)
 
-    total = len(all_contacts)
+    total = len(leads)
     updated = 0
     skipped = 0
     failed = 0
 
-    # Filter contacts: have jobtitle but no hs_seniority
+    if not leads:
+        logger.info("No leads with job_level found in database")
+        return {'total': 0, 'updated': 0, 'skipped': 0, 'failed': 0}
+
+    # Fetch current hs_seniority from HubSpot for these leads
+    logger.info(f"Checking hs_seniority for {len(leads)} leads in HubSpot...")
+    hubspot_ids = [lead['hubspot_id'] for lead in leads]
+
+    # Batch read contacts from HubSpot to check current hs_seniority
+    current_seniority = {}
+    for i in range(0, len(hubspot_ids), 100):
+        batch_ids = hubspot_ids[i:i + 100]
+        try:
+            # Use batch read to get current hs_seniority
+            endpoint = "/crm/v3/objects/contacts/batch/read"
+            payload = {
+                "inputs": [{"id": hid} for hid in batch_ids],
+                "properties": ["hs_seniority"]
+            }
+            response = hubspot._make_request('POST', endpoint, json=payload)
+            data = response.json()
+            for contact in data.get('results', []):
+                hs_seniority = contact.get('properties', {}).get('hs_seniority')
+                current_seniority[contact['id']] = hs_seniority
+        except Exception as e:
+            logger.warning(f"Failed to batch read contacts: {e}")
+            # Continue anyway, will try to update
+
+    # Build update list (only leads without hs_seniority)
     contacts_to_update = []
-    for contact in all_contacts:
-        props = contact.get('properties', {})
-        jobtitle = props.get('jobtitle')
-        hs_seniority = props.get('hs_seniority')
+    for lead in leads:
+        hubspot_id = lead['hubspot_id']
+        job_level = lead['job_level']
 
-        if jobtitle and not hs_seniority:
-            # Calculate job level
-            job_level = calculate_job_level(jobtitle)
-            hubspot_seniority = JOB_LEVEL_TO_HUBSPOT_SENIORITY.get(job_level, 'employee')
-
-            contacts_to_update.append({
-                'id': contact['id'],
-                'properties': {'hs_seniority': hubspot_seniority}
-            })
-        else:
+        # Check if already has hs_seniority in HubSpot
+        existing_seniority = current_seniority.get(hubspot_id)
+        if existing_seniority:
             skipped += 1
+            continue
 
-    logger.info(f"Found {len(contacts_to_update)} contacts to update, {skipped} skipped")
+        # Map job_level to HubSpot seniority
+        hubspot_seniority = JOB_LEVEL_TO_HUBSPOT_SENIORITY.get(job_level, 'employee')
+
+        contacts_to_update.append({
+            'id': hubspot_id,
+            'properties': {'hs_seniority': hubspot_seniority}
+        })
+
+    logger.info(f"Found {len(contacts_to_update)} contacts to update, {skipped} skipped (already have hs_seniority)")
 
     # Process in batches
     for i in range(0, len(contacts_to_update), batch_size):
@@ -1030,176 +1062,93 @@ def sync_job_levels_to_hubspot(hubspot_token: str,
     }
 
 
-def load_icp_scores() -> Dict[str, int]:
-    """Load ICP scores from database.
+def sync_departments_to_hubspot(hubspot_token: str,
+                                 campaign_id: Optional[str] = None,
+                                 batch_size: Optional[int] = None,
+                                 progress_callback=None) -> Dict[str, int]:
+    """Sync departments from Lemlist leads to HubSpot hs_role property.
 
-    Returns:
-        Dict mapping HubSpot_Code to ICP_Score: {'MACHINERY': 10, 'PLASTICS': 10, ...}
-    """
-    db = LemlistDB()
-    return db.get_icp_score_lookup()
-
-
-def load_joblevel_scores() -> Dict[str, int]:
-    """Load Job Level scores from database.
-
-    Returns:
-        Dict mapping job_level to score: {'owner': 10, 'director': 8, ...}
-    """
-    db = LemlistDB()
-    return db.get_joblevel_score_lookup()
-
-
-def sync_fit_scores_to_hubspot(hubspot_token: str,
-                               overwrite_existing: bool = False,
-                               batch_size: Optional[int] = None,
-                               progress_callback=None) -> Dict[str, int]:
-    """Sync industry_fit and joblevel_fit scores to HubSpot contacts.
-
-    For each contact:
-    1. Gets the primary associated company → industry → industry_fit
-    2. Gets hs_seniority → joblevel_fit
+    Uses department from local database (calculated from Lemlist job_title).
+    Only updates contacts that don't have hs_role set yet.
 
     Args:
         hubspot_token: HubSpot Private App access token
-        overwrite_existing: If True, update all contacts. If False, only update contacts without values.
+        campaign_id: Optional campaign ID to filter leads (None = all campaigns)
         batch_size: Number of contacts per batch (max 100, default HUBSPOT_BATCH_SIZE)
-        progress_callback: Optional callback function(current, total, status_text) for progress updates
+        progress_callback: Optional callback function(current, total) for progress updates
 
     Returns:
-        Dict with statistics: {
-            'total': int,
-            'updated': int,
-            'skipped': int,
-            'no_company': int,
-            'no_industry': int,
-            'no_seniority': int,
-            'failed': int
-        }
+        Dict with statistics: {'total': int, 'updated': int, 'skipped': int, 'failed': int}
     """
     if batch_size is None:
         batch_size = HUBSPOT_BATCH_SIZE
 
-    hubspot = HubSpotClient(hubspot_token)
+    db = LemlistDB()
+    hubspot = _create_hubspot_client(hubspot_token)
 
-    # Load ICP scores from DB
-    icp_lookup = load_icp_scores()
-    if not icp_lookup:
-        raise HubSpotError("Konnte ICP Scores nicht aus DB laden")
+    # Get leads from local DB with hubspot_id and department
+    logger.info("Loading leads with department from local database...")
+    leads = db.get_leads_with_department(campaign_id)
 
-    # Load Job Level scores from DB
-    joblevel_lookup = load_joblevel_scores()
-    if not joblevel_lookup:
-        raise HubSpotError("Konnte Job Level Scores nicht aus DB laden")
-
-    logger.info(f"Loaded {len(icp_lookup)} industry codes, {len(joblevel_lookup)} job levels from DB")
-
-    # Step 1: Fetch all contacts with company associations
-    if progress_callback:
-        progress_callback(0, 100, "Lade Kontakte mit Company-Verknüpfungen...")
-
-    all_contacts = hubspot.get_all_contacts_with_companies(['industry_fit', 'joblevel_fit', 'hs_seniority'])
-    total = len(all_contacts)
-
-    logger.info(f"Fetched {total} contacts with company associations")
-
-    # Step 2: Collect unique company IDs
-    company_ids = set()
-    contact_company_map = {}  # contact_id → primary_company_id
-
-    for contact in all_contacts:
-        contact_id = contact['id']
-        associations = contact.get('associations', {})
-        companies = associations.get('companies', {}).get('results', [])
-
-        if companies:
-            # Take first company as primary (HubSpot typically returns primary first)
-            primary_company_id = str(companies[0]['id'])
-            contact_company_map[contact_id] = primary_company_id
-            company_ids.add(primary_company_id)
-
-    logger.info(f"Found {len(company_ids)} unique companies to fetch")
-
-    # Step 3: Batch fetch company details
-    if progress_callback:
-        progress_callback(10, 100, f"Lade {len(company_ids)} Company-Details...")
-
-    company_data = hubspot.batch_get_companies(list(company_ids), ['industry', 'name'])
-
-    logger.info(f"Fetched {len(company_data)} company details")
-
-    # Step 4: Prepare updates
-    if progress_callback:
-        progress_callback(30, 100, "Berechne Fit Scores...")
-
-    contacts_to_update = []
+    total = len(leads)
+    updated = 0
     skipped = 0
-    no_company = 0
-    no_industry = 0
-    no_seniority = 0
+    failed = 0
 
-    for contact in all_contacts:
-        contact_id = contact['id']
-        props = contact.get('properties', {})
-        current_industry_fit = props.get('industry_fit')
-        current_joblevel_fit = props.get('joblevel_fit')
-        hs_seniority = props.get('hs_seniority')
+    if not leads:
+        logger.info("No leads with department found in database")
+        return {'total': 0, 'updated': 0, 'skipped': 0, 'failed': 0}
 
-        # Check if we need to update this contact
-        need_industry_update = overwrite_existing or not current_industry_fit
-        need_joblevel_update = overwrite_existing or not current_joblevel_fit
+    # Fetch current hs_role from HubSpot for these leads
+    logger.info(f"Checking hs_role for {len(leads)} leads in HubSpot...")
+    hubspot_ids = [lead['hubspot_id'] for lead in leads]
 
-        # Skip if nothing to update
-        if not need_industry_update and not need_joblevel_update:
+    # Batch read contacts from HubSpot to check current hs_role
+    current_role = {}
+    for i in range(0, len(hubspot_ids), 100):
+        batch_ids = hubspot_ids[i:i + 100]
+        try:
+            endpoint = "/crm/v3/objects/contacts/batch/read"
+            payload = {
+                "inputs": [{"id": hid} for hid in batch_ids],
+                "properties": ["hs_role"]
+            }
+            response = hubspot._make_request('POST', endpoint, json=payload)
+            data = response.json()
+            for contact in data.get('results', []):
+                hs_role = contact.get('properties', {}).get('hs_role')
+                current_role[contact['id']] = hs_role
+        except Exception as e:
+            logger.warning(f"Failed to batch read contacts: {e}")
+
+    # Build update list (only leads without hs_role)
+    contacts_to_update = []
+    for lead in leads:
+        hubspot_id = lead['hubspot_id']
+        department = lead['department']
+
+        # Check if already has hs_role in HubSpot
+        existing_role = current_role.get(hubspot_id)
+        if existing_role:
             skipped += 1
             continue
 
-        properties_to_update = {}
+        # Map department to HubSpot role
+        hubspot_role = DEPARTMENT_TO_HUBSPOT_ROLE.get(department)
+        if not hubspot_role:
+            skipped += 1
+            continue
 
-        # Calculate industry_fit
-        if need_industry_update:
-            company_id = contact_company_map.get(contact_id)
-            if not company_id:
-                no_company += 1
-                properties_to_update['industry_fit'] = 0
-            else:
-                company = company_data.get(company_id, {})
-                industry = company.get('properties', {}).get('industry')
+        contacts_to_update.append({
+            'id': hubspot_id,
+            'properties': {'hs_role': hubspot_role}
+        })
 
-                if not industry:
-                    no_industry += 1
-                    properties_to_update['industry_fit'] = 0
-                else:
-                    icp_score = icp_lookup.get(industry, 0)
-                    properties_to_update['industry_fit'] = icp_score
+    logger.info(f"Found {len(contacts_to_update)} contacts to update, {skipped} skipped")
 
-        # Calculate joblevel_fit
-        if need_joblevel_update:
-            if not hs_seniority:
-                no_seniority += 1
-                properties_to_update['joblevel_fit'] = 0
-            else:
-                joblevel_score = joblevel_lookup.get(hs_seniority, 0)
-                properties_to_update['joblevel_fit'] = joblevel_score
-
-        if properties_to_update:
-            contacts_to_update.append({
-                'id': contact_id,
-                'properties': properties_to_update
-            })
-
-    logger.info(f"Prepared {len(contacts_to_update)} contacts for update, {skipped} skipped, {no_company} no company, {no_industry} no industry, {no_seniority} no seniority")
-
-    # Step 5: Batch update contacts
-    updated = 0
-    failed = 0
-
+    # Process in batches
     for i in range(0, len(contacts_to_update), batch_size):
         batch = contacts_to_update[i:i + batch_size]
-
-        if progress_callback:
-            progress = 30 + int(70 * (i / len(contacts_to_update)))
-            progress_callback(progress, 100, f"Update... {i}/{len(contacts_to_update)}")
 
         try:
             hubspot.batch_update_contacts(batch)
@@ -1223,16 +1172,15 @@ def sync_fit_scores_to_hubspot(hubspot_token: str,
             logger.error(f"Batch {i // batch_size + 1} failed: {e}")
             failed += len(batch)
 
-        # Rate limit: 4 req/sec for Batch API
+        if progress_callback:
+            progress_callback(i + len(batch), len(contacts_to_update))
+
         time.sleep(HUBSPOT_BATCH_DELAY)
 
     return {
         'total': total,
         'updated': updated,
         'skipped': skipped,
-        'no_company': no_company,
-        'no_industry': no_industry,
-        'no_seniority': no_seniority,
         'failed': failed
     }
 
@@ -1441,7 +1389,7 @@ def main():
 
             if st.button("⬆️ Nach HubSpot syncen", use_container_width=True, disabled=sync_to_hubspot_disabled):
                 try:
-                    hubspot_client = HubSpotClient(hubspot_token)
+                    hubspot_client = _create_hubspot_client(hubspot_token)
                     if not hubspot_client.verify_token():
                         st.error("Ungültiger Token")
                     else:
@@ -1474,18 +1422,23 @@ def main():
             # Job Levels Sync Sub-Section
             st.markdown("---")
             st.markdown("**Job Levels Sync**")
-            st.caption("Setzt hs_seniority für alle HubSpot Kontakte basierend auf Job Title")
+            st.caption("Setzt hs_seniority für Lemlist-Leads basierend auf deren Job Title")
 
-            job_levels_disabled = not hubspot_token
+            # Count leads with job_level for this campaign
+            leads_with_job_level = len(db.get_leads_with_job_level(campaign_id)) if campaign_id else 0
+            job_levels_disabled = not (hubspot_token and leads_with_job_level > 0)
+
+            if leads_with_job_level > 0:
+                st.caption(f"📊 {leads_with_job_level} Leads mit Job Level")
 
             if st.button("🎯 Job Levels syncen", use_container_width=True, disabled=job_levels_disabled,
-                        help="Liest alle HubSpot Kontakte und setzt hs_seniority basierend auf jobtitle"):
+                        help="Synct job_level aus Lemlist nach HubSpot hs_seniority"):
                 try:
-                    hubspot_client = HubSpotClient(hubspot_token)
+                    hubspot_client = _create_hubspot_client(hubspot_token)
                     if not hubspot_client.verify_token():
                         st.error("Ungültiger Token")
                     else:
-                        progress_bar = st.progress(0, text="Lade alle HubSpot Kontakte...")
+                        progress_bar = st.progress(0, text="Lade Leads aus Datenbank...")
 
                         def update_job_level_progress(current, total):
                             progress = current / total if total > 0 else 0
@@ -1493,13 +1446,14 @@ def main():
 
                         result = sync_job_levels_to_hubspot(
                             hubspot_token,
+                            campaign_id=campaign_id,
                             batch_size=HUBSPOT_BATCH_SIZE,
                             progress_callback=update_job_level_progress
                         )
                         progress_bar.empty()
 
-                        st.success(f"✅ {result['updated']} von {result['total']} Kontakten aktualisiert")
-                        st.caption(f"Übersprungen: {result['skipped']} (bereits gesetzt oder kein Job Title)")
+                        st.success(f"✅ {result['updated']} von {result['total']} Leads aktualisiert")
+                        st.caption(f"Übersprungen: {result['skipped']} (hs_seniority bereits gesetzt)")
                         if result['failed'] > 0:
                             st.warning(f"⚠️ {result['failed']} fehlgeschlagen")
 
@@ -1510,48 +1464,41 @@ def main():
                 except HubSpotError as e:
                     st.error(f"Fehler: {str(e)}")
 
-            # Fit Scores Sync Sub-Section
+            # Department Sync Sub-Section
             st.markdown("---")
-            st.markdown("**Fit Scores Sync**")
-            st.caption("Setzt industry_fit und joblevel_fit basierend auf Company-Branche und Job Level")
+            st.markdown("**Department Sync**")
+            st.caption("Setzt hs_role für Lemlist-Leads basierend auf deren Job Title")
 
-            fit_sync_disabled = not hubspot_token
-            overwrite_fit_scores = st.checkbox("Bestehende Werte überschreiben", value=False,
-                                               help="Wenn aktiviert, werden auch Kontakte mit bestehenden Fit-Werten aktualisiert")
+            # Count leads with department for this campaign
+            leads_with_department = len(db.get_leads_with_department(campaign_id)) if campaign_id else 0
+            department_disabled = not (hubspot_token and leads_with_department > 0)
 
-            if st.button("🎯 Fit Scores syncen", use_container_width=True, disabled=fit_sync_disabled,
-                        help="Setzt industry_fit und joblevel_fit für alle Kontakte"):
+            if leads_with_department > 0:
+                st.caption(f"📊 {leads_with_department} Leads mit Department")
+
+            if st.button("🏢 Departments syncen", use_container_width=True, disabled=department_disabled,
+                        help="Synct department aus Lemlist nach HubSpot hs_role"):
                 try:
-                    hubspot_client = HubSpotClient(hubspot_token)
+                    hubspot_client = _create_hubspot_client(hubspot_token)
                     if not hubspot_client.verify_token():
                         st.error("Ungültiger Token")
                     else:
-                        progress_bar = st.progress(0, text="Starte...")
+                        progress_bar = st.progress(0, text="Lade Leads aus Datenbank...")
 
-                        def update_fit_progress(current, total, status_text):
+                        def update_department_progress(current, total):
                             progress = current / total if total > 0 else 0
-                            progress_bar.progress(progress, text=status_text)
+                            progress_bar.progress(progress, text=f"Update... {current}/{total}")
 
-                        result = sync_fit_scores_to_hubspot(
+                        result = sync_departments_to_hubspot(
                             hubspot_token,
-                            overwrite_existing=overwrite_fit_scores,
+                            campaign_id=campaign_id,
                             batch_size=HUBSPOT_BATCH_SIZE,
-                            progress_callback=update_fit_progress
+                            progress_callback=update_department_progress
                         )
                         progress_bar.empty()
 
-                        st.success(f"✅ {result['updated']} von {result['total']} Kontakten aktualisiert")
-                        details = []
-                        if result['skipped'] > 0:
-                            details.append(f"Übersprungen: {result['skipped']}")
-                        if result['no_company'] > 0:
-                            details.append(f"Ohne Company: {result['no_company']}")
-                        if result['no_industry'] > 0:
-                            details.append(f"Ohne Branche: {result['no_industry']}")
-                        if result['no_seniority'] > 0:
-                            details.append(f"Ohne Seniority: {result['no_seniority']}")
-                        if details:
-                            st.caption(" | ".join(details))
+                        st.success(f"✅ {result['updated']} von {result['total']} Leads aktualisiert")
+                        st.caption(f"Übersprungen: {result['skipped']} (hs_role bereits gesetzt)")
                         if result['failed'] > 0:
                             st.warning(f"⚠️ {result['failed']} fehlgeschlagen")
 
@@ -1561,127 +1508,6 @@ def main():
                     st.error(f"Rate Limit - warte {e.retry_after}s")
                 except HubSpotError as e:
                     st.error(f"Fehler: {str(e)}")
-
-            # ICP Branchen-Gewichtung Sub-Section
-            st.markdown("---")
-            st.markdown("**ICP Branchen-Gewichtung**")
-
-            icp_count = db.get_icp_score_count()
-            st.caption(f"{icp_count} Branchen in der Datenbank")
-
-            col_import, _ = st.columns([1, 2])
-            with col_import:
-                if st.button("📥 CSV importieren", use_container_width=True,
-                            help="Importiert ICP Scores aus Branchen_ICP_Gewichtung.csv"):
-                    try:
-                        imported = db.import_icp_scores_from_csv("Branchen_ICP_Gewichtung.csv")
-                        st.success(f"✅ {imported} Branchen importiert")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Import fehlgeschlagen: {e}")
-
-            if icp_count > 0:
-                icp_scores = db.get_all_icp_scores()
-                df_icp = pd.DataFrame(icp_scores)
-
-                # Rename columns for display
-                df_icp = df_icp.rename(columns={
-                    'hubspot_code': 'HubSpot Code',
-                    'branche': 'Branche',
-                    'icp_score': 'Score',
-                    'kategorie': 'Kategorie'
-                })
-
-                # Only show relevant columns for editing
-                df_display = df_icp[['HubSpot Code', 'Branche', 'Score', 'Kategorie']].copy()
-
-                edited_df = st.data_editor(
-                    df_display,
-                    column_config={
-                        "HubSpot Code": st.column_config.TextColumn(disabled=True),
-                        "Branche": st.column_config.TextColumn(disabled=True),
-                        "Score": st.column_config.NumberColumn(min_value=0, max_value=10),
-                        "Kategorie": st.column_config.TextColumn(disabled=True),
-                    },
-                    hide_index=True,
-                    use_container_width=True,
-                    height=300,
-                    key="icp_editor"
-                )
-
-                # Check for changes and save
-                if not df_display.equals(edited_df):
-                    # Find changed rows
-                    changes = []
-                    for idx, (orig, new) in enumerate(zip(df_display.itertuples(), edited_df.itertuples())):
-                        if orig.Score != new.Score:
-                            changes.append({
-                                'hubspot_code': orig._1,  # HubSpot Code
-                                'icp_score': new.Score
-                            })
-
-                    if changes:
-                        updated = db.bulk_update_icp_scores(changes)
-                        st.success(f"✅ {updated} Scores aktualisiert")
-
-            # Job Level Gewichtung Sub-Section
-            st.markdown("---")
-            st.markdown("**Job Level Gewichtung**")
-
-            joblevel_count = db.get_joblevel_score_count()
-            st.caption(f"{joblevel_count} Job Levels in der Datenbank")
-
-            col_jl_import, _ = st.columns([1, 2])
-            with col_jl_import:
-                if st.button("📥 CSV importieren", use_container_width=True,
-                            help="Importiert Job Level Scores aus Job_Level_Gewichtung.csv",
-                            key="import_joblevel"):
-                    try:
-                        imported = db.import_joblevel_scores_from_csv("Job_Level_Gewichtung.csv")
-                        st.success(f"✅ {imported} Job Levels importiert")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Import fehlgeschlagen: {e}")
-
-            if joblevel_count > 0:
-                joblevel_scores = db.get_all_joblevel_scores()
-                df_jl = pd.DataFrame(joblevel_scores)
-
-                # Rename columns for display
-                df_jl = df_jl.rename(columns={
-                    'job_level': 'Job Level',
-                    'score': 'Score'
-                })
-
-                # Only show relevant columns for editing
-                df_jl_display = df_jl[['Job Level', 'Score']].copy()
-
-                edited_jl_df = st.data_editor(
-                    df_jl_display,
-                    column_config={
-                        "Job Level": st.column_config.TextColumn(disabled=True),
-                        "Score": st.column_config.NumberColumn(min_value=0, max_value=10),
-                    },
-                    hide_index=True,
-                    use_container_width=True,
-                    height=200,
-                    key="joblevel_editor"
-                )
-
-                # Check for changes and save
-                if not df_jl_display.equals(edited_jl_df):
-                    # Find changed rows
-                    jl_changes = []
-                    for idx, (orig, new) in enumerate(zip(df_jl_display.itertuples(), edited_jl_df.itertuples())):
-                        if orig.Score != new.Score:
-                            jl_changes.append({
-                                'job_level': orig._1,  # Job Level
-                                'score': new.Score
-                            })
-
-                    if jl_changes:
-                        updated = db.bulk_update_joblevel_scores(jl_changes)
-                        st.success(f"✅ {updated} Job Level Scores aktualisiert")
 
             # Notes Analysis Sub-Section
             st.markdown("---")
@@ -1691,7 +1517,7 @@ def main():
 
             if st.button("📥 Notes laden", use_container_width=True, disabled=notes_analysis_disabled):
                 try:
-                    hubspot_client = HubSpotClient(hubspot_token)
+                    hubspot_client = _create_hubspot_client(hubspot_token)
                     analyzer = NotesAnalyzer(hubspot_client, db)
 
                     progress_bar = st.progress(0, text="Lade Notes...")
@@ -1717,7 +1543,7 @@ def main():
                 notes = st.session_state['hubspot_notes']
 
                 if hubspot_token:
-                    hubspot_client = HubSpotClient(hubspot_token)
+                    hubspot_client = _create_hubspot_client(hubspot_token)
                     analyzer = NotesAnalyzer(hubspot_client, db)
                     duplicates = analyzer.find_duplicates(notes)
                     dup_stats = analyzer.get_duplicate_stats(duplicates)

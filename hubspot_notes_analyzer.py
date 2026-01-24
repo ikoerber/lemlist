@@ -10,7 +10,6 @@ Provides functionality to:
 import re
 import logging
 from typing import Dict, List, Optional, Set, Tuple
-from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
